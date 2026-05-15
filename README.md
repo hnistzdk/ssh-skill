@@ -151,7 +151,7 @@ pip install paramiko
 ### 配置
 
 1. 将 `ssh-skill` 目录放到 `~/.claude/skills/` 下
-2. 配置 SSH 密钥或密码认证
+2. 配置 SSH 密钥认证，或通过环境变量 / SSH config 注释提供密码
 3. 开始使用！
 
 ## 🎬 快速开始
@@ -271,8 +271,8 @@ ssh_execute.py internal-server "docker ps"
 
 ## 🔐 安全特性
 
-- 支持密钥认证和密码认证
-- 密码加密存储在 SSH 配置注释中
+- 支持密钥认证、运行时密码认证和持久化密码认证
+- 环境变量密码优先，未设置时可回退到 SSH 配置注释中的 `# password:`
 - 支持密钥密码保护
 - 自动添加主机密钥（可配置）
 - 支持 SSH agent forwarding
@@ -330,6 +330,16 @@ Host prod-web-01
 ```
 
 ### 密码认证
+
+支持两种密码来源，优先级如下：
+1. 环境变量（优先覆盖）
+2. SSH config 注释中的持久化密码 `# password:`
+
+```bash
+export SSH_SKILL_PASSWORD_DEV_SERVER='your-password'
+# 或
+export SSH_PASSWORD_DEV_SERVER='your-password'
+```
 
 ```ssh-config
 # ===== dev-server =====

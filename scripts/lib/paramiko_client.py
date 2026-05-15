@@ -14,6 +14,25 @@ from dataclasses import dataclass
 from io import StringIO
 
 
+def _format_transfer_errors(errors) -> str:
+    if not errors:
+        return ''
+
+    if not isinstance(errors, list):
+        return str(errors)
+
+    messages = []
+    for error in errors:
+        if isinstance(error, dict):
+            message = error.get('message') or error.get('cause') or str(error)
+        else:
+            message = str(error)
+        if message:
+            messages.append(message)
+
+    return '; '.join(messages)
+
+
 @dataclass
 class SSHResult:
     """SSH命令执行结果"""
@@ -229,15 +248,12 @@ class ParamikoClient:
         self.forward_agent = forward_agent
         self.transfer_timeout = transfer_timeout  # 文件传输超时（None表示无限制）
         self._jump_clients = []  # 保存跳板机连接链
+        self._password_script = None
+        self._password_script_password = None
 
         # 验证认证方式
         if not password and not key_file:
             raise ValueError("必须提供 password 或 key_file")
-
-        # 为密码认证创建密码脚本（用于 scp 文件传输）
-        self._password_script = None
-        if self.password:
-            self._password_script = self._create_password_script()
 
         # Performance warning: Password auth + jump hosts has lower performance
         if self.password and self.jump_hosts:
@@ -260,35 +276,51 @@ class ParamikoClient:
         import stat
         import os
 
+        if not self.password:
+            raise ValueError("password is required to create SSH_ASKPASS helper")
+
         # 创建临时脚本文件
         fd, script_path = tempfile.mkstemp(suffix='.sh' if os.name != 'nt' else '.bat', text=True)
 
         if os.name == 'nt':
             # Windows 批处理脚本
-            script_content = f'@echo off\necho {self.password}\n'
+            script_content = '@echo off\r\n' \
+                'setlocal EnableExtensions DisableDelayedExpansion\r\n' \
+                'if "%SSH_SKILL_SCP_PASSWORD%"=="" exit /b 1\r\n' \
+                '<nul set /p =%SSH_SKILL_SCP_PASSWORD%\r\n'
         else:
             # Unix shell 脚本
-            script_content = f'#!/bin/sh\necho "{self.password}"\n'
+            script_content = '#!/bin/sh\n' \
+                'if [ -z "${SSH_SKILL_SCP_PASSWORD+x}" ]; then\n' \
+                '  exit 1\n' \
+                'fi\n' \
+                'printf %s "$SSH_SKILL_SCP_PASSWORD"\n'
 
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
             f.write(script_content)
 
         # 设置可执行权限（Unix）
         if os.name != 'nt':
             os.chmod(script_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
+        self._password_script_password = self.password
         return script_path
+
+    def _cleanup_password_script(self):
+        """清理 SSH_ASKPASS 临时脚本"""
+        if self._password_script:
+            try:
+                if os.path.exists(self._password_script):
+                    os.unlink(self._password_script)
+            except Exception:
+                pass
+            finally:
+                self._password_script = None
+                self._password_script_password = None
 
     def __del__(self):
         """析构函数，清理临时文件"""
-        # 在 Python 解释器关闭时，os 模块可能已被清理
-        if hasattr(self, '_password_script') and self._password_script:
-            try:
-                import os
-                if os.path.exists(self._password_script):
-                    os.unlink(self._password_script)
-            except:
-                pass
+        self._cleanup_password_script()
 
     def _build_jump_string(self) -> Optional[str]:
         """
@@ -377,11 +409,14 @@ class ParamikoClient:
         Returns:
             环境变量字典
         """
-        import os
         env = os.environ.copy()
+
+        if self.password and not self._password_script:
+            self._password_script = self._create_password_script()
 
         if self._password_script:
             env['SSH_ASKPASS'] = self._password_script
+            env['SSH_SKILL_SCP_PASSWORD'] = self._password_script_password or self.password or ''
             # DISPLAY 需要设置，即使在无 GUI 环境
             if 'DISPLAY' not in env:
                 env['DISPLAY'] = ':0'
@@ -757,7 +792,7 @@ class ParamikoClient:
                 return SSHResult(
                     success=False,
                     stdout="",
-                    stderr=f"Upload error: {'; '.join(result.errors)}",
+                    stderr=f"Upload error: {_format_transfer_errors(result.errors)}",
                     exit_code=-1
                 )
         except Exception as e:
@@ -837,7 +872,7 @@ class ParamikoClient:
                 return SSHResult(
                     success=False,
                     stdout="",
-                    stderr=f"Upload via jump host error: {'; '.join(result.errors)}",
+                    stderr=f"Upload via jump host error: {_format_transfer_errors(result.errors)}",
                     exit_code=-1
                 )
         except Exception as e:
@@ -898,7 +933,7 @@ class ParamikoClient:
 
             return SSHResult(
                 success=(process.returncode == 0),
-                stdout=stdout if process.returncode == 0 else f"File uploaded via scp: {local_path} -> {remote_path}",
+                stdout=(stdout.strip() if stdout.strip() else f"File uploaded via scp: {local_path} -> {remote_path}") if process.returncode == 0 else "",
                 stderr=stderr_output if process.returncode != 0 else "",
                 exit_code=process.returncode
             )
@@ -980,7 +1015,7 @@ class ParamikoClient:
                 return SSHResult(
                     success=False,
                     stdout="",
-                    stderr=f"Download error: {'; '.join(result.errors)}",
+                    stderr=f"Download error: {_format_transfer_errors(result.errors)}",
                     exit_code=-1
                 )
         except Exception as e:
@@ -1056,7 +1091,7 @@ class ParamikoClient:
                 return SSHResult(
                     success=False,
                     stdout="",
-                    stderr=f"Download via jump host error: {'; '.join(result.errors)}",
+                    stderr=f"Download via jump host error: {_format_transfer_errors(result.errors)}",
                     exit_code=-1
                 )
         except Exception as e:
@@ -1117,7 +1152,7 @@ class ParamikoClient:
 
             return SSHResult(
                 success=(process.returncode == 0),
-                stdout=stdout if process.returncode == 0 else f"File downloaded via scp: {remote_path} -> {local_path}",
+                stdout=(stdout.strip() if stdout.strip() else f"File downloaded via scp: {remote_path} -> {local_path}") if process.returncode == 0 else "",
                 stderr=stderr_output if process.returncode != 0 else "",
                 exit_code=process.returncode
             )
@@ -1167,7 +1202,7 @@ class ParamikoClient:
 
             # 如果有错误输出，也返回
             for line in stderr:
-                yield f"[STDERR] {line.rstrip('\\n')}"
+                yield "[STDERR] " + line.rstrip('\n')
 
         except Exception as e:
             yield f"[ERROR] Execution error: {str(e)}"

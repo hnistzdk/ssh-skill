@@ -8,6 +8,49 @@ import subprocess
 import sys
 import os
 import json
+import argparse
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _script_dir)
+
+from reporting import add_reporting_arguments, emit_json, verbose_details
+
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(operation, target, code, message, details=None, cause=None, retriable=False, mode='local'):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
+
+
+def _build_success(operation, target, result, mode='local', args=None, **details):
+    payload = dict(result)
+    reporting = verbose_details(args, **details)
+    if reporting:
+        payload['reporting'] = reporting
+    return {
+        'schema_version': '1.0',
+        'success': True,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'result': payload,
+        'error': None,
+    }
 
 
 def check_windows_ssh_agent():
@@ -20,7 +63,6 @@ def check_windows_ssh_agent():
         }
 
     try:
-        # 检查服务状态（使用 UTF-8 编码）
         result = subprocess.run(
             ['powershell', '-NoProfile', '-Command',
              '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
@@ -39,13 +81,10 @@ def check_windows_ssh_agent():
                 'message': 'OpenSSH Authentication Agent 服务不存在（需要安装 OpenSSH 客户端）'
             }
 
-        # 解析服务状态
         service_info = json.loads(result.stdout)
         status = service_info.get('Status', 0)
         start_type = service_info.get('StartType', 0)
 
-        # Status: 1=Stopped, 4=Running
-        # StartType: 2=Automatic, 3=Manual, 4=Disabled
         is_running = (status == 4)
         is_auto = (start_type == 2)
 
@@ -74,7 +113,6 @@ def start_windows_ssh_agent():
         }
 
     try:
-        # 尝试启动服务（使用 UTF-8 编码）
         result = subprocess.run(
             ['powershell', '-NoProfile', '-Command',
              '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Start-Service ssh-agent'],
@@ -90,19 +128,17 @@ def start_windows_ssh_agent():
                 'success': True,
                 'message': 'SSH Agent 服务已启动'
             }
-        else:
-            # 检查是否是权限问题
-            if 'Access is denied' in result.stderr or '拒绝访问' in result.stderr:
-                return {
-                    'success': False,
-                    'message': '需要管理员权限启动服务',
-                    'admin_required': True
-                }
-            else:
-                return {
-                    'success': False,
-                    'message': f'启动失败: {result.stderr}'
-                }
+
+        if 'Access is denied' in result.stderr or '拒绝访问' in result.stderr:
+            return {
+                'success': False,
+                'message': '需要管理员权限启动服务',
+                'admin_required': True
+            }
+        return {
+            'success': False,
+            'message': f'启动失败: {result.stderr}'
+        }
 
     except Exception as e:
         return {
@@ -120,7 +156,6 @@ def enable_windows_ssh_agent_auto_start():
         }
 
     try:
-        # 设置为自动启动（使用 UTF-8 编码）
         result = subprocess.run(
             ['powershell', '-NoProfile', '-Command',
              '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Set-Service -Name ssh-agent -StartupType Automatic'],
@@ -136,20 +171,18 @@ def enable_windows_ssh_agent_auto_start():
                 'success': True,
                 'message': 'SSH Agent 已设置为自动启动'
             }
-        else:
-            # 检查是否是权限问题（移除换行符后检查）
-            stderr_clean = result.stderr.replace('\n', ' ').replace('\r', ' ').lower()
-            if ('access' in stderr_clean and 'denied' in stderr_clean) or 'permissiondenied' in stderr_clean:
-                return {
-                    'success': False,
-                    'message': '需要管理员权限修改服务配置',
-                    'admin_required': True
-                }
-            else:
-                return {
-                    'success': False,
-                    'message': f'设置失败: {result.stderr}'
-                }
+
+        stderr_clean = result.stderr.replace('\n', ' ').replace('\r', ' ').lower()
+        if ('access' in stderr_clean and 'denied' in stderr_clean) or 'permissiondenied' in stderr_clean:
+            return {
+                'success': False,
+                'message': '需要管理员权限修改服务配置',
+                'admin_required': True
+            }
+        return {
+            'success': False,
+            'message': f'设置失败: {result.stderr}'
+        }
 
     except Exception as e:
         return {
@@ -173,7 +206,6 @@ def setup_windows_ssh_agent(auto_start=True):
         'steps': []
     }
 
-    # 1. 检查服务状态
     status = check_windows_ssh_agent()
     result['steps'].append({
         'step': 'check_service',
@@ -184,7 +216,6 @@ def setup_windows_ssh_agent(auto_start=True):
         result['message'] = status.get('message', 'SSH Agent 服务不可用')
         return result
 
-    # 2. 如果启动类型是 Disabled，先设置为 Automatic
     if status.get('start_type') == 'Disabled':
         auto_result = enable_windows_ssh_agent_auto_start()
         result['steps'].append({
@@ -197,7 +228,6 @@ def setup_windows_ssh_agent(auto_start=True):
             result['admin_required'] = auto_result.get('admin_required', False)
             return result
 
-    # 3. 如果未运行，启动服务
     if not status.get('running'):
         start_result = start_windows_ssh_agent()
         result['steps'].append({
@@ -210,7 +240,6 @@ def setup_windows_ssh_agent(auto_start=True):
             result['admin_required'] = start_result.get('admin_required', False)
             return result
 
-    # 4. 如果需要且还未设置，确保自动启动
     if auto_start and not status.get('auto_start') and status.get('start_type') != 'Disabled':
         auto_result = enable_windows_ssh_agent_auto_start()
         result['steps'].append({
@@ -219,7 +248,6 @@ def setup_windows_ssh_agent(auto_start=True):
         })
 
         if not auto_result.get('success'):
-            # 自动启动失败不影响整体成功
             result['warning'] = auto_result.get('message')
 
     result['success'] = True
@@ -251,9 +279,8 @@ ssh-add C:\\Users\\YourName\\.ssh\\id_ed25519
 
 def main():
     """命令行入口"""
-    import argparse
-
     parser = argparse.ArgumentParser(description='Windows SSH Agent 配置工具')
+    add_reporting_arguments(parser)
     parser.add_argument('action', choices=['check', 'start', 'setup', 'instructions'],
                         help='操作：check=检查状态, start=启动服务, setup=一键配置, instructions=显示手动配置说明')
     parser.add_argument('--no-auto-start', action='store_true',
@@ -263,22 +290,72 @@ def main():
 
     if args.action == 'check':
         result = check_windows_ssh_agent()
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        emit_json(_build_success(
+            operation='windows_ssh_agent_check',
+            target='ssh-agent',
+            args=args,
+            result=result,
+            platform=os.name,
+        ), args=args, ensure_ascii=False)
+        return 0
 
-    elif args.action == 'start':
+    if args.action == 'start':
         result = start_windows_ssh_agent()
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result.get('success'):
+            emit_json(_build_success(
+                operation='windows_ssh_agent_start',
+                target='ssh-agent',
+                args=args,
+                result=result,
+                platform=os.name,
+            ), args=args, ensure_ascii=False)
+            return 0
+        emit_json(_build_failure(
+            operation='windows_ssh_agent_start',
+            target='ssh-agent',
+            code='auth_error' if result.get('admin_required') else 'internal_error',
+            message=result.get('message', '启动失败'),
+            details=result,
+            cause=result.get('message'),
+            retriable=bool(result.get('admin_required')),
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
-    elif args.action == 'setup':
+    if args.action == 'setup':
         result = setup_windows_ssh_agent(auto_start=not args.no_auto_start)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result.get('success'):
+            emit_json(_build_success(
+                operation='windows_ssh_agent_setup',
+                target='ssh-agent',
+                args=args,
+                result=result,
+                auto_start=not args.no_auto_start,
+                platform=os.name,
+            ), args=args, ensure_ascii=False)
+            return 0
+        failure_details = dict(result)
+        if result.get('admin_required'):
+            failure_details['instructions'] = get_setup_instructions()
+        emit_json(_build_failure(
+            operation='windows_ssh_agent_setup',
+            target='ssh-agent',
+            code='auth_error' if result.get('admin_required') else 'internal_error',
+            message=result.get('message', '配置失败'),
+            details=failure_details,
+            cause=result.get('message'),
+            retriable=bool(result.get('admin_required')),
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
-        if not result['success'] and result.get('admin_required'):
-            print("\n" + get_setup_instructions())
-
-    elif args.action == 'instructions':
-        print(get_setup_instructions())
+    emit_json(_build_success(
+        operation='windows_ssh_agent_instructions',
+        target='ssh-agent',
+        args=args,
+        result={'instructions': get_setup_instructions()},
+        platform=os.name,
+    ), args=args, ensure_ascii=False)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

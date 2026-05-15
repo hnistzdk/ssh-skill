@@ -8,19 +8,23 @@ import os
 import posixpath
 import stat
 import time
-import json
-import sys
-from typing import Optional, Callable, List, Dict, Tuple
+from typing import Optional, Callable, List, Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
-try:
-    from .paramiko_client import SSHResult
-except ImportError:
-    from paramiko_client import SSHResult
-
 
 CHUNK_SIZE = 128 * 1024  # 128KB 传输块（优化大文件传输性能）
+
+
+def _build_transfer_error(code: str, message: str, details: Optional[Dict[str, Any]] = None,
+                          cause: Optional[str] = None, retriable: bool = False) -> Dict[str, Any]:
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
 
 
 @dataclass
@@ -81,7 +85,7 @@ class TransferResult:
     files_transferred: int = 0
     files_failed: int = 0
     bytes_transferred: int = 0
-    errors: List[str] = field(default_factory=list)
+    errors: List[Dict[str, Any]] = field(default_factory=list)
     details: List[Dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -105,6 +109,17 @@ def _human_size(size_bytes: int) -> str:
     elif size_bytes >= 1024:
         return f"{size_bytes / 1024:.2f} KB"
     return f"{size_bytes} B"
+
+
+def _single_error_result(code: str, message: str, details: Optional[Dict[str, Any]] = None,
+                         cause: Optional[str] = None, retriable: bool = False,
+                         bytes_transferred: int = 0, files_failed: int = 1) -> TransferResult:
+    return TransferResult(
+        success=False,
+        files_failed=files_failed,
+        bytes_transferred=bytes_transferred,
+        errors=[_build_transfer_error(code, message, details=details, cause=cause, retriable=retriable)],
+    )
 
 
 def _remote_exists(sftp, path: str) -> bool:
@@ -171,8 +186,10 @@ class SFTPTransfer:
         """
         local_path = os.path.abspath(local_path)
         if not os.path.isfile(local_path):
-            return TransferResult(
-                success=False, errors=[f"本地文件不存在: {local_path}"]
+            return _single_error_result(
+                'cli_argument_error',
+                f'Local file not found: {local_path}',
+                details={'local_path': local_path, 'remote_path': remote_path},
             )
 
         local_size = os.path.getsize(local_path)
@@ -258,11 +275,16 @@ class SFTPTransfer:
                 }]
             )
         except Exception as e:
-            return TransferResult(
-                success=False,
-                files_failed=1,
+            return _single_error_result(
+                'transport_error',
+                f'Upload failed for {os.path.basename(local_path)}',
+                details={
+                    'local_path': local_path,
+                    'remote_path': remote_path,
+                    'file': os.path.basename(local_path),
+                },
+                cause=str(e),
                 bytes_transferred=progress.transferred_bytes,
-                errors=[f"上传失败 {os.path.basename(local_path)}: {e}"],
             )
 
     def download_file(self, remote_path: str, local_path: str,
@@ -280,8 +302,11 @@ class SFTPTransfer:
             remote_stat = self.sftp.stat(remote_path)
             remote_size = remote_stat.st_size
         except (FileNotFoundError, IOError) as e:
-            return TransferResult(
-                success=False, errors=[f"远程文件不存在: {remote_path}"]
+            return _single_error_result(
+                'transport_error',
+                f'Remote file not found: {remote_path}',
+                details={'remote_path': remote_path, 'local_path': local_path},
+                cause=str(e),
             )
 
         # 如果本地路径是目录，追加文件名
@@ -358,11 +383,16 @@ class SFTPTransfer:
                 }]
             )
         except Exception as e:
-            return TransferResult(
-                success=False,
-                files_failed=1,
+            return _single_error_result(
+                'transport_error',
+                f'Download failed for {posixpath.basename(remote_path)}',
+                details={
+                    'remote_path': remote_path,
+                    'local_path': local_path,
+                    'file': posixpath.basename(remote_path),
+                },
+                cause=str(e),
                 bytes_transferred=progress.transferred_bytes,
-                errors=[f"下载失败 {posixpath.basename(remote_path)}: {e}"],
             )
 
     def upload_directory(self, local_dir: str, remote_dir: str,
@@ -377,8 +407,10 @@ class SFTPTransfer:
         """
         local_dir = os.path.abspath(local_dir)
         if not os.path.isdir(local_dir):
-            return TransferResult(
-                success=False, errors=[f"本地目录不存在: {local_dir}"]
+            return _single_error_result(
+                'cli_argument_error',
+                f'Local directory not found: {local_dir}',
+                details={'local_path': local_dir, 'remote_path': remote_dir},
             )
 
         # 确保远程根目录存在
@@ -426,8 +458,10 @@ class SFTPTransfer:
             resume: 是否断点续传
         """
         if not _remote_isdir(self.sftp, remote_dir):
-            return TransferResult(
-                success=False, errors=[f"远程目录不存在: {remote_dir}"]
+            return _single_error_result(
+                'transport_error',
+                f'Remote directory not found: {remote_dir}',
+                details={'remote_path': remote_dir, 'local_path': local_dir},
             )
 
         local_dir = os.path.abspath(local_dir)
@@ -447,7 +481,12 @@ class SFTPTransfer:
         try:
             entries = self.sftp.listdir_attr(remote_dir)
         except Exception as e:
-            result.errors.append(f"无法列出目录 {remote_dir}: {e}")
+            result.errors.append(_build_transfer_error(
+                'transport_error',
+                f'Unable to list remote directory: {remote_dir}',
+                details={'remote_path': remote_dir, 'local_path': local_dir},
+                cause=str(e),
+            ))
             result.files_failed += 1
             return
 

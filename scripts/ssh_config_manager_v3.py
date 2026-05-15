@@ -10,7 +10,7 @@ SSH Config 管理工具 v3.1
 2. 支持别名（Host）管理
 3. 元数据存储在注释中（无需单独的 metadata 文件）
 4. 支持 ProxyJump（跳板机）配置
-5. 保留 config 文件的注释和格式
+5. 支持在注释中持久化密码，并兼容运行时环境变量覆盖
 
 注释元数据格式：
 # ===== 服务器名称 =====
@@ -18,6 +18,7 @@ SSH Config 管理工具 v3.1
 # environment: production|development|staging
 # tags: tag1,tag2,tag3
 # location: 物理位置
+# password: your-password
 # created_at: 2026-03-01
 # updated_at: 2026-03-01
 Host alias
@@ -61,17 +62,55 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
+import paramiko
+
 # 修复 Windows 终端 UTF-8 输出
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-try:
-    import paramiko
-except ImportError:
-    print("错误: 需要安装 paramiko 库", file=sys.stderr)
-    print("请运行: pip install paramiko", file=sys.stderr)
-    sys.exit(1)
+# 添加 lib 到路径
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_script_dir, 'lib'))
+
+from reporting import add_reporting_arguments, emit_json, verbose_details
+
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(operation, target, code, message, details=None, cause=None, retriable=False, mode='local'):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
+
+
+def _build_success(operation, target, result, mode='local', args=None, **details):
+    payload = dict(result)
+    reporting = verbose_details(args, **details)
+    if reporting:
+        payload['reporting'] = reporting
+    return {
+        'schema_version': '1.0',
+        'success': True,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'result': payload,
+        'error': None,
+    }
 
 
 class SSHConfigManager:
@@ -127,13 +166,27 @@ class SSHConfigManager:
                 key = key.strip()
                 value = value.strip()
 
-                if key in ['description', 'environment', 'location', 'password', 'created_at', 'updated_at']:
+                if key in ['description', 'environment', 'location', 'created_at', 'updated_at', 'password']:
                     metadata[key] = value
                 elif key == 'tags':
                     # 标签用逗号分隔
                     metadata['tags'] = [t.strip() for t in value.split(',') if t.strip()]
 
         return metadata
+
+    @staticmethod
+    def _extract_host_aliases(host_line: str) -> List[str]:
+        """从 Host 行提取别名列表，忽略通配符模式"""
+        match = re.match(r'Host\s+(.+)', host_line.strip())
+        if not match:
+            return []
+
+        aliases = []
+        for alias in match.group(1).split():
+            alias = alias.strip()
+            if alias and '*' not in alias and '?' not in alias:
+                aliases.append(alias)
+        return aliases
 
     def read_config_with_metadata(self) -> List[Tuple[str, dict, List[str], List[str]]]:
         """
@@ -149,7 +202,7 @@ class SSHConfigManager:
         current_comments = []
         current_host_comments = []  # 当前 Host 的注释
         current_config = []
-        current_alias = None
+        current_aliases: List[str] = []
         in_host_block = False
 
         with open(self.config_path, 'r', encoding='utf-8') as f:
@@ -161,14 +214,14 @@ class SSHConfigManager:
             # 检查是否是 Host 行
             if stripped.startswith('Host ') and not stripped.startswith('Host *'):
                 # 保存上一个 Host 块
-                if current_alias:
+                if current_aliases:
                     metadata = self.parse_metadata_from_comments(current_host_comments)
-                    results.append((current_alias, metadata, current_host_comments, current_config))
+                    for current_alias in current_aliases:
+                        results.append((current_alias, metadata, current_host_comments, current_config))
 
                 # 开始新的 Host 块
-                host_match = re.match(r'Host\s+(.+)', stripped)
-                if host_match:
-                    current_alias = host_match.group(1).strip()
+                current_aliases = self._extract_host_aliases(stripped)
+                if current_aliases:
                     current_config = [line]
                     current_host_comments = current_comments  # 保存当前收集的注释给这个 Host
                     current_comments = []  # 清空，准备收集下一个 Host 的注释
@@ -202,9 +255,10 @@ class SSHConfigManager:
                     current_comments = []
 
         # 保存最后一个 Host 块
-        if current_alias:
+        if current_aliases:
             metadata = self.parse_metadata_from_comments(current_host_comments)
-            results.append((current_alias, metadata, current_host_comments, current_config))
+            for current_alias in current_aliases:
+                results.append((current_alias, metadata, current_host_comments, current_config))
 
         return results
 
@@ -250,10 +304,7 @@ class SSHConfigManager:
             for line in f:
                 line = line.strip()
                 if line.startswith('Host ') and not line.startswith('Host *'):
-                    host_match = re.match(r'Host\s+(.+)', line)
-                    if host_match:
-                        host_name = host_match.group(1).strip()
-                        hosts.append(host_name)
+                    hosts.extend(self._extract_host_aliases(line))
         return hosts
 
     def create_host(self, alias: str, hostname: str, user: str,
@@ -262,7 +313,8 @@ class SSHConfigManager:
                    environment: str = "development",
                    description: str = "",
                    tags: Optional[List[str]] = None,
-                   location: str = "") -> bool:
+                   location: str = "",
+                   password: str = "") -> bool:
         """
         创建新的 Host 配置（带注释元数据）
 
@@ -277,6 +329,7 @@ class SSHConfigManager:
             description: 描述
             tags: 标签列表
             location: 物理位置
+            password: 持久化密码
 
         Returns:
             是否成功创建
@@ -301,6 +354,9 @@ class SSHConfigManager:
 
         if location:
             comment_lines.append(f"# location: {location}\n")
+
+        if password:
+            comment_lines.append(f"# password: {password}\n")
 
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         comment_lines.append(f"# created_at: {now}\n")
@@ -338,7 +394,8 @@ class SSHConfigManager:
                    environment: Optional[str] = None,
                    description: Optional[str] = None,
                    tags: Optional[List[str]] = None,
-                   location: Optional[str] = None) -> bool:
+                   location: Optional[str] = None,
+                   password: Optional[str] = None) -> bool:
         """
         更新 Host 配置（包括注释元数据）
 
@@ -353,6 +410,7 @@ class SSHConfigManager:
             description: 描述（可选）
             tags: 标签列表（可选）
             location: 物理位置（可选）
+            password: 持久化密码（可选）
 
         Returns:
             是否成功更新
@@ -383,12 +441,12 @@ class SSHConfigManager:
 
             # 检查是否是目标 Host 行
             if stripped.startswith('Host '):
-                host_match = re.match(r'Host\s+(.+)', stripped)
-                if host_match and host_match.group(1).strip() == alias:
+                host_aliases = self._extract_host_aliases(stripped)
+                if alias in host_aliases:
                     found = True
                     # 找到目标 Host，更新元数据注释
                     updated_comments = self._update_metadata_comments(
-                        skip_comments, alias, environment, description, tags, location
+                        skip_comments, alias, environment, description, tags, location, password
                     )
                     new_lines.extend(updated_comments)
                     skip_comments = []
@@ -452,7 +510,8 @@ class SSHConfigManager:
                                   environment: Optional[str],
                                   description: Optional[str],
                                   tags: Optional[List[str]],
-                                  location: Optional[str]) -> List[str]:
+                                  location: Optional[str],
+                                  password: Optional[str]) -> List[str]:
         """更新元数据注释"""
         # 解析现有元数据
         metadata = self.parse_metadata_from_comments(comment_lines)
@@ -466,6 +525,8 @@ class SSHConfigManager:
             metadata['tags'] = tags
         if location is not None:
             metadata['location'] = location
+        if password is not None:
+            metadata['password'] = password
 
         # 更新时间戳
         metadata['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -490,7 +551,6 @@ class SSHConfigManager:
         if metadata.get('location'):
             new_comments.append(f"# location: {metadata['location']}\n")
 
-        # 保留 password 字段（如果存在）
         if metadata.get('password'):
             new_comments.append(f"# password: {metadata['password']}\n")
 
@@ -594,8 +654,8 @@ class SSHConfigManager:
 
             # 检查是否是目标 Host 行
             if stripped.startswith('Host '):
-                host_match = re.match(r'Host\s+(.+)', stripped)
-                if host_match and host_match.group(1).strip() == alias:
+                host_aliases = self._extract_host_aliases(stripped)
+                if alias in host_aliases:
                     # 找到目标 Host，跳过它和它的配置行
                     i += 1
                     # 跳过缩进的配置行
@@ -730,7 +790,11 @@ class SSHConfigManager:
                 "hostname": config.get('hostname'),
                 "user": config.get('user'),
                 "port": config.get('port', 22),
-                "identity_file": config.get('identityfile', [None])[0] if config.get('identityfile') else None,
+                "identity_file": (
+                    config.get('identityfile')[0]
+                    if isinstance(config.get('identityfile'), list)
+                    else config.get('identityfile')
+                ) if config.get('identityfile') else None,
                 "proxy_jump": config.get('proxyjump'),
                 "metadata": metadata
             }
@@ -740,36 +804,56 @@ class SSHConfigManager:
         return export_data
 
 
-def _get_auth_method(config, meta) -> str:
+def _normalize_alias_for_env(alias: str) -> str:
+    """将别名转换为环境变量后缀"""
+    return re.sub(r'[^A-Za-z0-9]+', '_', alias).strip('_').upper()
+
+
+def _has_runtime_password(alias: str) -> bool:
+    """判断是否配置了运行时密码环境变量"""
+    candidates = []
+    normalized_alias = _normalize_alias_for_env(alias)
+    if normalized_alias:
+        candidates.extend([
+            f'SSH_SKILL_PASSWORD_{normalized_alias}',
+            f'SSH_PASSWORD_{normalized_alias}',
+        ])
+
+    candidates.extend([
+        'SSH_SKILL_PASSWORD',
+        'SSH_PASSWORD',
+    ])
+
+    return any(os.environ.get(env_name) for env_name in candidates)
+
+
+def _get_auth_method(alias: str, config, metadata: Optional[dict] = None) -> str:
     """判断认证方式"""
-    has_password = bool(meta.get('password'))
-    identity_files = config.get('identityfile', [])
-    has_key = bool(identity_files and identity_files[0])
-
-    if has_password and has_key:
-        return "密码+密钥"
-    elif has_password:
-        return "密码"
-    elif has_key:
-        return "密钥"
+    identity_files = (config or {}).get('identityfile')
+    if isinstance(identity_files, list):
+        has_key = bool(identity_files and identity_files[0])
     else:
-        return "未配置"
+        has_key = bool(identity_files)
+    has_runtime_password = _has_runtime_password(alias)
+    has_persisted_password = bool((metadata or {}).get('password'))
 
-
-def _load_password_metadata(manager, alias) -> str:
-    """从注释中加载密码信息（仅判断有无）"""
-    try:
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
-        from config_v3 import SSHConfigLoaderV3
-        loader = SSHConfigLoaderV3()
-        meta = loader.load_metadata(alias)
-        return meta.get('password', '')
-    except Exception:
-        return ''
+    if has_key and has_runtime_password:
+        return "运行时密码+密钥"
+    if has_key and has_persisted_password:
+        return "持久化密码+密钥"
+    if has_runtime_password:
+        return "运行时密码"
+    if has_persisted_password:
+        return "持久化密码"
+    if has_key:
+        return "密钥"
+    return "未配置"
 
 
 def cmd_list_servers(args):
     """列出所有服务器"""
+    operation = 'list_servers'
+    target = args.environment or ','.join(args.tags or []) or 'all'
     try:
         manager = SSHConfigManager()
         servers = manager.list_servers(
@@ -777,20 +861,8 @@ def cmd_list_servers(args):
             tags=args.tags
         )
 
-        if not servers:
-            print(json.dumps({
-                'success': True,
-                'message': '未找到服务器',
-                'servers': []
-            }, ensure_ascii=False, indent=2))
-            return
-
         result_list = []
         for alias, config, meta in servers:
-            # 补充密码信息（从 config_v3 加载，注释元数据中的 password 字段）
-            if 'password' not in meta:
-                meta['password'] = _load_password_metadata(manager, alias)
-
             result_list.append({
                 'alias': alias,
                 'hostname': config.get('hostname'),
@@ -799,36 +871,46 @@ def cmd_list_servers(args):
                 'description': meta.get('description', ''),
                 'tags': meta.get('tags', []),
                 'location': meta.get('location', ''),
-                'auth': _get_auth_method(config, meta),
+                'auth': _get_auth_method(alias, config, meta),
             })
 
-        print(json.dumps({
-            'success': True,
-            'count': len(result_list),
-            'servers': result_list
-        }, ensure_ascii=False, indent=2))
+        emit_json(_build_success(
+            operation=operation,
+            target=target,
+            args=args,
+            result={
+                'count': len(result_list),
+                'servers': result_list,
+                **({'message': '未找到服务器'} if not result_list else {}),
+            },
+            environment=args.environment,
+            tags=args.tags,
+            config_path=manager.config_path,
+        ), args=args, ensure_ascii=False)
+        return 0
 
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': str(e)
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        sys.exit(1)
+        emit_json(_build_failure(
+            operation=operation,
+            target=target,
+            code='internal_error',
+            message='列出服务器失败',
+            details={
+                'environment': args.environment,
+                'tags': args.tags,
+            },
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
 
 def cmd_find(args):
     """查找服务器"""
+    operation = 'find_server'
     try:
         manager = SSHConfigManager()
         results = manager.find_host(args.query)
-
-        if not results:
-            print(json.dumps({
-                'success': True,
-                'message': f'未找到匹配 "{args.query}" 的服务器',
-                'results': []
-            }, ensure_ascii=False, indent=2))
-            return
 
         result_list = []
         for alias, config, meta in results:
@@ -840,25 +922,39 @@ def cmd_find(args):
                 'environment': meta.get('environment', 'unknown'),
                 'description': meta.get('description', ''),
                 'tags': meta.get('tags', []),
-                'location': meta.get('location', '')
+                'location': meta.get('location', ''),
+                'auth': _get_auth_method(alias, config, meta)
             })
 
-        print(json.dumps({
-            'success': True,
-            'count': len(result_list),
-            'results': result_list
-        }, ensure_ascii=False, indent=2))
+        emit_json(_build_success(
+            operation=operation,
+            target=args.query,
+            args=args,
+            result={
+                'count': len(result_list),
+                'results': result_list,
+                **({'message': f'未找到匹配 "{args.query}" 的服务器'} if not result_list else {}),
+            },
+            query=args.query,
+        ), args=args, ensure_ascii=False)
+        return 0
 
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': str(e)
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        sys.exit(1)
+        emit_json(_build_failure(
+            operation=operation,
+            target=args.query,
+            code='internal_error',
+            message='查找服务器失败',
+            details={'query': args.query},
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
 
 def cmd_create(args):
     """创建服务器配置"""
+    operation = 'create_server'
     try:
         manager = SSHConfigManager()
 
@@ -872,37 +968,72 @@ def cmd_create(args):
             environment=args.environment,
             description=args.description or "",
             tags=args.tags or [],
-            location=args.location or ""
+            location=args.location or "",
+            password=args.password or ""
         )
 
-        if success:
-            print(json.dumps({
-                'success': True,
+        if not success:
+            emit_json(_build_failure(
+                operation=operation,
+                target=args.alias,
+                code='internal_error',
+                message='创建失败',
+                details={'alias': args.alias},
+                retriable=False,
+            ), args=args, stream=sys.stderr, ensure_ascii=False)
+            return 1
+
+        emit_json(_build_success(
+            operation=operation,
+            target=args.alias,
+            args=args,
+            result={
                 'message': f'服务器 {args.alias} 创建成功',
                 'alias': args.alias,
-                'config_file': manager.config_path
-            }, ensure_ascii=False, indent=2))
-        else:
-            print(json.dumps({
-                'success': False,
-                'error': '创建失败'
-            }, ensure_ascii=False, indent=2), file=sys.stderr)
-            sys.exit(1)
+                'config_file': manager.config_path,
+            },
+            alias=args.alias,
+            host=args.host,
+            user=args.user,
+            port=args.port,
+            jump=args.jump,
+            environment=args.environment,
+            tags=args.tags,
+            location=args.location,
+            password=args.password,
+        ), args=args, ensure_ascii=False)
+        return 0
 
+    except ValueError as e:
+        emit_json(_build_failure(
+            operation=operation,
+            target=args.alias,
+            code='cli_argument_error',
+            message=str(e),
+            details={'alias': args.alias},
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': str(e)
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        sys.exit(1)
+        emit_json(_build_failure(
+            operation=operation,
+            target=args.alias,
+            code='internal_error',
+            message='创建服务器配置失败',
+            details={'alias': args.alias},
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
 
 def cmd_update(args):
     """更新服务器配置"""
+    operation = 'update_server'
     try:
         manager = SSHConfigManager()
 
-        # 准备更新参数（只传递非 None 的参数）
         update_kwargs = {'alias': args.alias}
 
         if args.host is not None:
@@ -923,60 +1054,114 @@ def cmd_update(args):
             update_kwargs['tags'] = args.tags
         if args.location is not None:
             update_kwargs['location'] = args.location
+        if args.password is not None:
+            update_kwargs['password'] = args.password
 
         success = manager.update_host(**update_kwargs)
 
-        if success:
-            print(json.dumps({
-                'success': True,
+        if not success:
+            emit_json(_build_failure(
+                operation=operation,
+                target=args.alias,
+                code='target_resolution_error',
+                message='更新失败',
+                details={'alias': args.alias},
+                retriable=False,
+            ), args=args, stream=sys.stderr, ensure_ascii=False)
+            return 1
+
+        emit_json(_build_success(
+            operation=operation,
+            target=args.alias,
+            args=args,
+            result={
                 'message': f'服务器 {args.alias} 更新成功',
                 'alias': args.alias,
-                'config_file': manager.config_path
-            }, ensure_ascii=False, indent=2))
-        else:
-            print(json.dumps({
-                'success': False,
-                'error': '更新失败'
-            }, ensure_ascii=False, indent=2), file=sys.stderr)
-            sys.exit(1)
+                'config_file': manager.config_path,
+            },
+            alias=args.alias,
+            host=args.host,
+            user=args.user,
+            port=args.port,
+            jump=args.jump,
+            environment=args.environment,
+            tags=args.tags,
+            location=args.location,
+            password=args.password,
+        ), args=args, ensure_ascii=False)
+        return 0
 
+    except ValueError as e:
+        emit_json(_build_failure(
+            operation=operation,
+            target=args.alias,
+            code='cli_argument_error',
+            message=str(e),
+            details={'alias': args.alias},
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': str(e)
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        sys.exit(1)
+        emit_json(_build_failure(
+            operation=operation,
+            target=args.alias,
+            code='internal_error',
+            message='更新服务器配置失败',
+            details={'alias': args.alias},
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
 
 def cmd_delete(args):
     """删除服务器配置"""
+    operation = 'delete_server'
     try:
         manager = SSHConfigManager()
-
         success = manager.delete_host(args.alias)
 
-        if success:
-            print(json.dumps({
-                'success': True,
-                'message': f'服务器 {args.alias} 已删除'
-            }, ensure_ascii=False, indent=2))
-        else:
-            print(json.dumps({
-                'success': False,
-                'error': f'服务器 {args.alias} 不存在'
-            }, ensure_ascii=False, indent=2), file=sys.stderr)
-            sys.exit(1)
+        if not success:
+            emit_json(_build_failure(
+                operation=operation,
+                target=args.alias,
+                code='target_resolution_error',
+                message=f'服务器 {args.alias} 不存在',
+                details={'alias': args.alias},
+                retriable=False,
+            ), args=args, stream=sys.stderr, ensure_ascii=False)
+            return 1
+
+        emit_json(_build_success(
+            operation=operation,
+            target=args.alias,
+            args=args,
+            result={
+                'message': f'服务器 {args.alias} 已删除',
+                'alias': args.alias,
+            },
+            alias=args.alias,
+        ), args=args, ensure_ascii=False)
+        return 0
 
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': str(e)
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        sys.exit(1)
+        emit_json(_build_failure(
+            operation=operation,
+            target=args.alias,
+            code='internal_error',
+            message='删除服务器配置失败',
+            details={'alias': args.alias},
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
 
 def cmd_export(args):
     """导出配置"""
+    operation = 'export_config'
+    target = args.output or 'stdout'
     try:
         manager = SSHConfigManager()
         export_data = manager.export_config()
@@ -985,27 +1170,37 @@ def cmd_export(args):
             with open(args.output, 'w', encoding='utf-8') as f:
                 json.dump(export_data, f, ensure_ascii=False, indent=2)
 
-            print(json.dumps({
-                'success': True,
-                'message': f'配置已导出到 {args.output}',
-                'count': len(export_data['hosts'])
-            }, ensure_ascii=False, indent=2))
-        else:
-            print(json.dumps(export_data, ensure_ascii=False, indent=2))
+        emit_json(_build_success(
+            operation=operation,
+            target=target,
+            args=args,
+            result={
+                'message': f'配置已导出到 {args.output}' if args.output else '配置导出成功',
+                'count': len(export_data['hosts']),
+                'export': export_data,
+            },
+            output=args.output,
+            config_path=manager.config_path,
+        ), args=args, ensure_ascii=False)
+        return 0
 
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': str(e)
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        sys.exit(1)
-
-
+        emit_json(_build_failure(
+            operation=operation,
+            target=target,
+            code='internal_error',
+            message='导出配置失败',
+            details={'output': args.output},
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 def main():
     parser = argparse.ArgumentParser(
         description='SSH Config 管理工具 v3.1（基于注释元数据）',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    add_reporting_arguments(parser)
 
     subparsers = parser.add_subparsers(dest='command', help='子命令')
 
@@ -1030,6 +1225,7 @@ def main():
     create_parser.add_argument('--description', help='描述')
     create_parser.add_argument('--tags', nargs='+', help='标签列表')
     create_parser.add_argument('--location', help='物理位置')
+    create_parser.add_argument('--password', help='持久化密码')
 
     # update 命令
     update_parser = subparsers.add_parser('update', help='更新服务器配置')
@@ -1043,6 +1239,7 @@ def main():
     update_parser.add_argument('--description', help='描述')
     update_parser.add_argument('--tags', nargs='+', help='标签列表')
     update_parser.add_argument('--location', help='物理位置')
+    update_parser.add_argument('--password', help='持久化密码')
 
     # delete 命令
     delete_parser = subparsers.add_parser('delete', help='删除服务器配置')
@@ -1056,22 +1253,23 @@ def main():
 
     if not args.command:
         parser.print_help()
-        sys.exit(1)
+        return 1
 
-    # 执行命令
     if args.command == 'list-servers':
-        cmd_list_servers(args)
-    elif args.command == 'find':
-        cmd_find(args)
-    elif args.command == 'create':
-        cmd_create(args)
-    elif args.command == 'update':
-        cmd_update(args)
-    elif args.command == 'delete':
-        cmd_delete(args)
-    elif args.command == 'export':
-        cmd_export(args)
+        return cmd_list_servers(args)
+    if args.command == 'find':
+        return cmd_find(args)
+    if args.command == 'create':
+        return cmd_create(args)
+    if args.command == 'update':
+        return cmd_update(args)
+    if args.command == 'delete':
+        return cmd_delete(args)
+    if args.command == 'export':
+        return cmd_export(args)
+
+    return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

@@ -151,7 +151,7 @@ pip install paramiko
 ### Configuration
 
 1. Place the `ssh-skill` directory under `~/.claude/skills/`
-2. Configure SSH key or password authentication
+2. Configure SSH key authentication, or provide passwords through environment variables / SSH config comments
 3. Start using!
 
 ## 🎬 Quick Start
@@ -271,8 +271,8 @@ Daemon Mode:
 
 ## 🔐 Security Features
 
-- Support key and password authentication
-- Password encrypted storage in SSH config comments
+- Support key authentication, runtime password authentication, and persisted password authentication
+- Environment variable passwords take precedence, with fallback to `# password:` in SSH config comments
 - Support key password protection
 - Auto-add host keys (configurable)
 - Support SSH agent forwarding
@@ -330,6 +330,16 @@ Host prod-web-01
 ```
 
 ### Password Authentication
+
+Two password sources are supported, with this priority:
+1. Environment variables (override first)
+2. Persisted `# password:` in SSH config comments
+
+```bash
+export SSH_SKILL_PASSWORD_DEV_SERVER='your-password'
+# or
+export SSH_PASSWORD_DEV_SERVER='your-password'
+```
 
 ```ssh-config
 # ===== dev-server =====

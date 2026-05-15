@@ -8,14 +8,12 @@
 2. 支持别名（Host）
 3. 元数据从注释中解析
 4. 完全兼容 ProxyJump（跳板机）
-5. 支持密码认证（从注释中读取）
+5. 支持从注释持久化密码，并允许环境变量覆盖
 """
 
 import os
-import json
 import re
-from typing import Dict, Optional, List
-from pathlib import Path
+from typing import Optional, List
 
 try:
     import paramiko
@@ -29,22 +27,17 @@ class SSHConfigLoaderV3:
     从标准 OpenSSH config 文件加载配置
     """
 
-    def __init__(self, config_path: Optional[str] = None,
-                 metadata_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None):
         """
         初始化加载器
 
         Args:
             config_path: SSH config 文件路径，默认 ~/.ssh/config
-            metadata_path: 元数据文件路径，默认 ~/.ssh/config_metadata.json
         """
         if config_path is None:
             config_path = os.path.expanduser("~/.ssh/config")
-        if metadata_path is None:
-            metadata_path = os.path.expanduser("~/.ssh/config_metadata.json")
 
         self.config_path = config_path
-        self.metadata_path = metadata_path
 
     def load_ssh_config(self, alias: str) -> dict:
         """
@@ -63,22 +56,60 @@ class SSHConfigLoaderV3:
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"SSH config 文件不存在: {self.config_path}")
 
-        # 解析 SSH config
         ssh_config = paramiko.SSHConfig()
         with open(self.config_path, 'r', encoding='utf-8') as f:
             ssh_config.parse(f)
 
-        # 获取配置
         try:
             host_config = ssh_config.lookup(alias)
         except Exception as e:
             raise ValueError(f"无法解析别名 '{alias}': {e}")
 
-        # 检查是否真的找到了配置（paramiko 会返回默认值）
         if host_config.get('hostname') == alias and not self._alias_exists(alias):
             raise ValueError(f"别名 '{alias}' 不存在于 SSH config 中")
 
         return host_config
+
+    @staticmethod
+    def _extract_host_aliases(host_line: str) -> List[str]:
+        """从 Host 行提取别名列表，忽略通配符模式"""
+        match = re.match(r'Host\s+(.+)', host_line.strip())
+        if not match:
+            return []
+
+        aliases = []
+        for host_alias in match.group(1).split():
+            host_alias = host_alias.strip()
+            if host_alias and '*' not in host_alias and '?' not in host_alias:
+                aliases.append(host_alias)
+        return aliases
+
+    @staticmethod
+    def _normalize_alias_for_env(alias: str) -> str:
+        """将别名转换为环境变量后缀"""
+        return re.sub(r'[^A-Za-z0-9]+', '_', alias).strip('_').upper()
+
+    def _load_runtime_password(self, alias: str) -> str:
+        """从环境变量加载运行时密码"""
+        candidates = []
+        normalized_alias = self._normalize_alias_for_env(alias)
+        if normalized_alias:
+            candidates.extend([
+                f'SSH_SKILL_PASSWORD_{normalized_alias}',
+                f'SSH_PASSWORD_{normalized_alias}',
+            ])
+
+        candidates.extend([
+            'SSH_SKILL_PASSWORD',
+            'SSH_PASSWORD',
+        ])
+
+        for env_name in candidates:
+            value = os.environ.get(env_name)
+            if value:
+                return value
+
+        return ''
 
     def _alias_exists(self, alias: str) -> bool:
         """检查别名是否存在于 SSH config 中"""
@@ -87,14 +118,69 @@ class SSHConfigLoaderV3:
                 for line in f:
                     line = line.strip()
                     if line.startswith('Host ') and not line.startswith('Host *'):
-                        # 提取 Host 名称
-                        import re
-                        host_match = re.match(r'Host\s+(.+)', line)
-                        if host_match and host_match.group(1).strip() == alias:
+                        if alias in self._extract_host_aliases(line):
                             return True
             return False
         except Exception:
             return False
+
+    def _resolve_password(self, alias: str, metadata: dict) -> str:
+        """解析密码：环境变量优先，其次使用注释中的持久化密码"""
+        runtime_password = self._load_runtime_password(alias)
+        if runtime_password:
+            return runtime_password
+
+        persisted_password = metadata.get('password')
+        if persisted_password:
+            return persisted_password
+
+        return ''
+
+    def _build_jump_hosts(self, proxy_jump: str) -> List[dict]:
+        """将 ProxyJump 配置解析为 Paramiko 可用的跳板机链"""
+        jump_hosts: List[dict] = []
+        seen = set()
+
+        def append_alias(alias: str):
+            if alias in seen:
+                raise ValueError(f"检测到循环 ProxyJump 配置: {alias}")
+            seen.add(alias)
+
+            config = self.load_ssh_config(alias)
+            metadata = self.load_metadata(alias)
+
+            nested_proxy_jump = config.get('proxyjump')
+            if nested_proxy_jump:
+                for nested_alias in nested_proxy_jump.split(','):
+                    nested_alias = nested_alias.strip()
+                    if nested_alias:
+                        append_alias(nested_alias)
+
+            jump_host = {
+                'host': config.get('hostname'),
+                'user': config.get('user'),
+                'port': int(config.get('port', 22)),
+            }
+
+            identity_files = config.get('identityfile')
+            if identity_files:
+                if isinstance(identity_files, list):
+                    jump_host['key_file'] = identity_files[0]
+                else:
+                    jump_host['key_file'] = identity_files
+
+            password = self._resolve_password(alias, metadata)
+            if password:
+                jump_host['password'] = password
+
+            jump_hosts.append(jump_host)
+
+        for jump_alias in proxy_jump.split(','):
+            jump_alias = jump_alias.strip()
+            if jump_alias:
+                append_alias(jump_alias)
+
+        return jump_hosts
 
     def load_metadata(self, alias: str) -> dict:
         """
@@ -104,38 +190,33 @@ class SSHConfigLoaderV3:
             alias: 主机别名
 
         Returns:
-            元数据字典（包括密码）
+            元数据字典
         """
         metadata = {
             'description': '',
             'environment': 'unknown',
             'tags': [],
             'location': '',
-            'password': ''
+            'password': '',
         }
 
-        # 读取 config 文件，查找该 Host 前的注释
         if not os.path.exists(self.config_path):
             return metadata
 
         with open(self.config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        # 查找 Host 行
         host_line_index = -1
         for i, line in enumerate(lines):
             stripped = line.strip()
             if stripped.startswith('Host ') and not stripped.startswith('Host *'):
-                import re
-                match = re.match(r'Host\s+(.+)', stripped)
-                if match and match.group(1).strip() == alias:
+                if alias in self._extract_host_aliases(stripped):
                     host_line_index = i
                     break
 
         if host_line_index == -1:
             return metadata
 
-        # 向前查找注释
         comment_lines = []
         i = host_line_index - 1
         while i >= 0:
@@ -147,20 +228,16 @@ class SSHConfigLoaderV3:
             else:
                 break
 
-        # 解析注释
         for line in comment_lines:
             line = line.strip()
             if not line.startswith('#'):
                 continue
 
-            # 移除开头的 #
             line = line[1:].strip()
 
-            # 跳过分隔线
             if line.startswith('=====') or line == '':
                 continue
 
-            # 解析 key: value 格式
             if ':' in line:
                 key, value = line.split(':', 1)
                 key = key.strip()
@@ -192,37 +269,32 @@ class SSHConfigLoaderV3:
         config = self.load_ssh_config(alias)
         metadata = self.load_metadata(alias)
 
-        # 提取连接参数
         params = {
             'hostname': config.get('hostname'),
             'user': config.get('user'),
             'port': int(config.get('port', 22)),
-            'timeout': 30,  # 默认超时
+            'timeout': 30,
         }
 
-        # 密钥文件
         identity_files = config.get('identityfile')
         if identity_files:
-            # paramiko 返回的是列表
             if isinstance(identity_files, list):
                 params['key_file'] = identity_files[0]
             else:
                 params['key_file'] = identity_files
 
-        # 密码（从注释元数据中获取）
-        if metadata.get('password'):
-            params['password'] = metadata['password']
+        password = self._resolve_password(alias, metadata)
+        if password:
+            params['password'] = password
 
-        # ProxyJump（跳板机）
         proxy_jump = config.get('proxyjump')
         if proxy_jump:
             params['proxy_jump'] = proxy_jump
+            params['jump_hosts'] = self._build_jump_hosts(proxy_jump)
 
-        # ForwardAgent（SSH agent 转发）
         forward_agent = config.get('forwardagent', 'no').lower()
         params['forward_agent'] = forward_agent in ('yes', 'true', '1')
 
-        # 元数据
         params['metadata'] = metadata
         params['alias'] = alias
 
@@ -234,7 +306,7 @@ class SSHConfigLoaderV3:
 
         策略：
         - 有密钥文件且无密码 → 使用 NativeSSHClient（原生 SSH）
-        - 有密码 → 使用 ParamikoClient（Paramiko）
+        - 有密码（环境变量或持久化注释） → 使用 ParamikoClient（Paramiko）
 
         Args:
             alias: 主机别名
@@ -244,12 +316,10 @@ class SSHConfigLoaderV3:
         """
         params = self.get_connection_params(alias)
 
-        has_key = params.get('key_file') is not None
-        has_password = params.get('password') is not None
+        has_key = bool(params.get('key_file'))
+        has_password = bool(params.get('password'))
 
-        # 智能选择客户端类型
         if has_key and not has_password:
-            # 密钥认证 → 使用原生 SSH（支持 agent forwarding）
             try:
                 from .native_ssh_client import NativeSSHClient
             except ImportError:
@@ -266,7 +336,6 @@ class SSHConfigLoaderV3:
                 alias=alias
             )
         else:
-            # 密码认证 → 使用 Paramiko
             try:
                 from .paramiko_client import ParamikoClient
             except ImportError:
@@ -278,10 +347,11 @@ class SSHConfigLoaderV3:
                 port=params['port'],
                 password=params.get('password'),
                 key_file=params.get('key_file'),
-                timeout=params['timeout']
+                timeout=params['timeout'],
+                jump_hosts=params.get('jump_hosts'),
+                forward_agent=params.get('forward_agent', False)
             )
 
-        # 设置别名（用于守护进程标识）
         client.alias = alias
 
         return client
@@ -291,23 +361,15 @@ class SSHConfigLoaderV3:
         """获取默认 SSH config 路径"""
         return os.path.expanduser("~/.ssh/config")
 
-    @staticmethod
-    def get_default_metadata_path() -> str:
-        """获取默认元数据路径"""
-        return os.path.expanduser("~/.ssh/config_metadata.json")
 
-
-# 向后兼容：提供全局函数接口
-def get_config_loader_v3(config_path: Optional[str] = None,
-                         metadata_path: Optional[str] = None) -> SSHConfigLoaderV3:
+def get_config_loader_v3(config_path: Optional[str] = None) -> SSHConfigLoaderV3:
     """
     获取配置加载器实例
 
     Args:
         config_path: SSH config 文件路径
-        metadata_path: 元数据文件路径
 
     Returns:
         SSHConfigLoaderV3 实例
     """
-    return SSHConfigLoaderV3(config_path, metadata_path)
+    return SSHConfigLoaderV3(config_path)

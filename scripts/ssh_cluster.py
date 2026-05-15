@@ -30,6 +30,35 @@ import argparse
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
 
 from cluster import SSHCluster
+from reporting import add_reporting_arguments, emit_json, verbose_details
+
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(operation, target, code, message, details=None, cause=None, retriable=False):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': operation,
+        'target': target,
+        'mode': 'cluster',
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
+
+
+def _build_result_payload(result, extra_details=None):
+    payload = dict(result)
+    if extra_details:
+        payload['reporting'] = extra_details
+    return payload
 
 
 def main():
@@ -42,15 +71,26 @@ def main():
     parser.add_argument('--timeout', type=int, help='超时时间（秒）')
     parser.add_argument('--health-check', action='store_true', help='健康检查模式')
     parser.add_argument('--max-workers', type=int, default=10, help='最大并发数')
+    add_reporting_arguments(parser)
 
     args = parser.parse_args()
+    target = args.hosts or args.environment or 'all'
+    reporting = verbose_details(
+        args,
+        command=args.command,
+        hosts=args.hosts,
+        environment=args.environment,
+        tags=args.tags,
+        parallel=args.parallel,
+        timeout=args.timeout,
+        health_check=args.health_check,
+        max_workers=args.max_workers,
+    )
 
     try:
-        # 解析参数
         aliases = args.hosts.split(',') if args.hosts else None
         tags = args.tags.split(',') if args.tags else None
 
-        # 加载集群
         cluster = SSHCluster.from_ssh_config(
             aliases=aliases,
             environment=args.environment,
@@ -59,10 +99,18 @@ def main():
         )
 
         if not cluster.clients:
-            print(json.dumps({
-                'success': False,
-                'error': 'No servers matched the filter criteria'
-            }, ensure_ascii=True, indent=2), file=sys.stderr)
+            emit_json(_build_failure(
+                operation='cluster_execute',
+                target=target,
+                code='target_resolution_error',
+                message='No servers matched the filter criteria',
+                details={
+                    'hosts': aliases,
+                    'environment': args.environment,
+                    'tags': tags,
+                },
+                retriable=False,
+            ), args=args, stream=sys.stderr, ensure_ascii=True)
             sys.exit(1)
 
         if args.health_check:
@@ -79,41 +127,79 @@ def main():
                 'unhealthy': sum(1 for v in health.values() if not v),
                 'results': {name: {'healthy': status} for name, status in health.items()}
             }
-
-            print(json.dumps(output, ensure_ascii=True, indent=2))
+            emit_json({
+                'schema_version': '1.0',
+                'success': all(health.values()),
+                'operation': 'cluster_health_check',
+                'target': target,
+                'mode': 'cluster',
+                'result': _build_result_payload(output, extra_details=reporting),
+                'error': None,
+            }, args=args, ensure_ascii=True)
             sys.exit(0 if all(health.values()) else 1)
 
-        else:
-            results = cluster.execute_all(
-                args.command,
-                parallel=args.parallel,
-                timeout=args.timeout
-            )
+        results = cluster.execute_all(
+            args.command,
+            parallel=args.parallel,
+            timeout=args.timeout
+        )
 
-            output = {
-                'success': all(r.success for r in results.values()),
-                'total': len(results),
-                'successful': sum(1 for r in results.values() if r.success),
-                'failed': sum(1 for r in results.values() if not r.success),
-                'results': {
-                    name: {
-                        'success': result.success,
-                        'exit_code': result.exit_code,
-                        'stdout': result.stdout,
-                        'stderr': result.stderr
-                    }
-                    for name, result in results.items()
+        output = {
+            'success': all(r.success for r in results.values()),
+            'total': len(results),
+            'successful': sum(1 for r in results.values() if r.success),
+            'failed': sum(1 for r in results.values() if not r.success),
+            'results': {
+                name: {
+                    'success': result.success,
+                    'exit_code': result.exit_code,
+                    'stdout': result.stdout,
+                    'stderr': result.stderr
                 }
+                for name, result in results.items()
             }
+        }
 
-            print(json.dumps(output, ensure_ascii=True, indent=2))
-            sys.exit(0 if all(r.success for r in results.values()) else 1)
+        emit_json({
+            'schema_version': '1.0',
+            'success': output['success'],
+            'operation': 'cluster_execute',
+            'target': target,
+            'mode': 'cluster',
+            'result': _build_result_payload(output, extra_details=reporting),
+            'error': None,
+        }, args=args, ensure_ascii=True)
+        sys.exit(0 if output['success'] else 1)
 
+    except FileNotFoundError as e:
+        emit_json(_build_failure(
+            operation='cluster_execute',
+            target=target,
+            code='target_resolution_error',
+            message=f'Config file not found: {e}',
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
+        sys.exit(1)
+    except ValueError as e:
+        emit_json(_build_failure(
+            operation='cluster_execute',
+            target=target,
+            code='cli_argument_error',
+            message=str(e),
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
+        sys.exit(1)
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': str(e)
-        }, ensure_ascii=True, indent=2), file=sys.stderr)
+        emit_json(_build_failure(
+            operation='cluster_execute',
+            target=target,
+            code='internal_error',
+            message=str(e),
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
         sys.exit(1)
 
 

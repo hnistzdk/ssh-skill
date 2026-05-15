@@ -26,24 +26,34 @@ import sys
 import os
 import json
 import argparse
-import re
 
 # 添加lib到路径
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_script_dir, 'lib'))
 
+from path_normalization import normalize_remote_path, PathNormalizationError
+from reporting import add_reporting_arguments, emit_json, progress_enabled, verbose_details
 
-def _fix_remote_path(path):
-    """修复被 MSYS bash 转换的远程路径（Windows 环境）"""
-    # 检测 MSYS 路径转换：X:/... 或 X:\...
-    if re.match(r'^[A-Za-z]:[/\\]', path):
-        print(json.dumps({
-            'success': False,
-            'error': f'Remote path looks like a Windows path (MSYS conversion): {path}. '
-                     f'Use MSYS_NO_PATHCONV=1 prefix or quote the path.'
-        }, ensure_ascii=True, indent=2), file=sys.stderr)
-        sys.exit(1)
-    return path
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(alias, code, message, details=None, cause=None, retriable=False):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': 'upload',
+        'target': alias,
+        'mode': None,
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
 
 
 def progress_callback(progress):
@@ -54,6 +64,46 @@ def progress_callback(progress):
         sys.stderr.flush()
     except Exception:
         pass
+
+
+def _build_result_payload(raw_result, extra_details=None):
+    if not isinstance(raw_result, dict):
+        payload = {'value': raw_result}
+    else:
+        payload = {}
+        for key, value in raw_result.items():
+            if key in ('success', 'error'):
+                continue
+            payload[key] = value
+
+    if extra_details:
+        payload['reporting'] = extra_details
+
+    return payload
+
+
+def _build_transfer_error(output, local_path, remote_path):
+    errors = output.get('errors') or []
+    messages = []
+    if isinstance(errors, list):
+        for item in errors:
+            if isinstance(item, dict):
+                message = item.get('message') or item.get('cause') or str(item)
+            else:
+                message = str(item)
+            if message:
+                messages.append(message)
+        message = '; '.join(messages)
+    else:
+        message = str(errors)
+
+    return _build_error(
+        'transport_error',
+        message or 'Upload failed',
+        details={'local_path': local_path, 'remote_path': remote_path, 'errors': errors},
+        cause=message or None,
+        retriable=False,
+    )
 
 
 def main():
@@ -67,9 +117,21 @@ def main():
                         help='Upload directory recursively')
     parser.add_argument('--no-progress', action='store_true',
                         help='Disable progress output')
+    add_reporting_arguments(parser)
 
     args = parser.parse_args()
-    remote_path = _fix_remote_path(args.remote_path)
+
+    try:
+        remote_path = normalize_remote_path(args.remote_path, role='remote_path')
+    except PathNormalizationError as e:
+        emit_json(_build_failure(
+            alias=args.alias,
+            code=e.code,
+            message=str(e),
+            details=e.to_error().get('details'),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
+        sys.exit(1)
 
     try:
         # 加载配置
@@ -82,6 +144,7 @@ def main():
 
         # 检查文件大小，大文件（>80MB）使用 Paramiko SFTP 以显示进度
         local_path_abs = os.path.abspath(args.local_path)
+        file_size_mb = 0.0
         is_large_file = False
         if os.path.isfile(local_path_abs):
             file_size_mb = os.path.getsize(local_path_abs) / (1024 * 1024)
@@ -90,6 +153,15 @@ def main():
         # 智能选择：密钥认证且不需要高级功能且文件不大时，使用原生 SSH
         # 大文件、断点续传、递归上传、密码认证时使用 Paramiko SFTP
         use_native = has_key and not has_password and not args.resume and not args.recursive and not is_large_file
+        reporting = verbose_details(
+            args,
+            transport='native' if use_native else 'paramiko',
+            progress_enabled=progress_enabled(args),
+            resume=args.resume,
+            recursive=args.recursive,
+            file_size_mb=round(file_size_mb, 2) if os.path.isfile(local_path_abs) else None,
+            is_large_file=is_large_file if os.path.isfile(local_path_abs) else None,
+        )
 
         if use_native:
             # 使用原生 SSH（简单上传，性能更好）
@@ -97,19 +169,36 @@ def main():
             local_path = os.path.abspath(args.local_path)
 
             if not os.path.exists(local_path):
-                print(json.dumps({
-                    'success': False,
-                    'error': f'Path not found: {args.local_path}'
-                }, ensure_ascii=True, indent=2), file=sys.stderr)
+                emit_json(_build_failure(
+                    alias=args.alias,
+                    code='cli_argument_error',
+                    message=f'Path not found: {args.local_path}',
+                    details={'local_path': args.local_path},
+                    retriable=False,
+                ), args=args, stream=sys.stderr, ensure_ascii=True)
                 sys.exit(1)
 
-            result = client.upload(local_path, remote_path, show_progress=not args.no_progress)
-            print(json.dumps({
+            result = client.upload(local_path, remote_path, show_progress=progress_enabled(args))
+            emit_json({
+                'schema_version': '1.0',
                 'success': result.success,
-                'stdout': result.stdout,
-                'stderr': result.stderr,
-                'exit_code': result.exit_code
-            }, ensure_ascii=True, indent=2))
+                'operation': 'upload',
+                'target': args.alias,
+                'mode': 'native',
+                'result': {
+                    'stdout': result.stdout,
+                    'stderr': result.stderr,
+                    'exit_code': result.exit_code,
+                    **({'reporting': reporting} if reporting else {}),
+                },
+                'error': None if result.success else _build_error(
+                    'transport_error',
+                    result.stderr or 'Upload failed',
+                    details={'local_path': args.local_path, 'remote_path': remote_path},
+                    cause=result.stderr,
+                    retriable=False,
+                )
+            }, args=args, ensure_ascii=True)
             sys.exit(0 if result.success else 1)
         else:
             # 使用 Paramiko SFTP（支持断点续传、递归上传等高级功能）
@@ -121,6 +210,8 @@ def main():
                 password=params.get('password'),
                 key_file=params.get('key_file'),
                 timeout=30,
+                jump_hosts=params.get('jump_hosts'),
+                forward_agent=params.get('forward_agent', False),
                 transfer_timeout=None  # 大文件传输不设超时限制
             )
 
@@ -133,7 +224,7 @@ def main():
 
             # 创建传输器
             from sftp_transfer import SFTPTransfer
-            cb = None if args.no_progress else progress_callback
+            cb = None if not progress_enabled(args) else progress_callback
             transfer = SFTPTransfer(sftp, progress_callback=cb)
 
             local_path = os.path.abspath(args.local_path)
@@ -141,10 +232,13 @@ def main():
         # 判断是文件还是目录
         if os.path.isdir(local_path):
             if not args.recursive:
-                print(json.dumps({
-                    'success': False,
-                    'error': f'"{args.local_path}" is a directory. Use --recursive to upload directories.'
-                }, ensure_ascii=True, indent=2), file=sys.stderr)
+                emit_json(_build_failure(
+                    alias=args.alias,
+                    code='cli_argument_error',
+                    message=f'"{args.local_path}" is a directory. Use --recursive to upload directories.',
+                    details={'local_path': args.local_path},
+                    retriable=False,
+                ), args=args, stream=sys.stderr, ensure_ascii=True)
                 sys.exit(1)
             result = transfer.upload_directory(local_path, remote_path,
                                                resume=args.resume)
@@ -152,10 +246,13 @@ def main():
             result = transfer.upload_file(local_path, remote_path,
                                           resume=args.resume)
         else:
-            print(json.dumps({
-                'success': False,
-                'error': f'Path not found: {args.local_path}'
-            }, ensure_ascii=True, indent=2), file=sys.stderr)
+            emit_json(_build_failure(
+                alias=args.alias,
+                code='cli_argument_error',
+                message=f'Path not found: {args.local_path}',
+                details={'local_path': args.local_path},
+                retriable=False,
+            ), args=args, stream=sys.stderr, ensure_ascii=True)
             sys.exit(1)
 
         # 关闭 SFTP
@@ -163,26 +260,44 @@ def main():
 
         # 输出结果
         output = result.to_dict()
-        print(json.dumps(output, ensure_ascii=True, indent=2))
-        sys.exit(0 if result.success else 1)
+        success = bool(output.get('success'))
+        emit_json({
+            'schema_version': '1.0',
+            'success': success,
+            'operation': 'upload',
+            'target': args.alias,
+            'mode': 'paramiko',
+            'result': _build_result_payload(output, extra_details=reporting),
+            'error': None if success else _build_transfer_error(output, args.local_path, remote_path)
+        }, args=args, ensure_ascii=True)
+        sys.exit(0 if success else 1)
 
     except FileNotFoundError as e:
-        print(json.dumps({
-            'success': False,
-            'error': f'File not found: {e}'
-        }, ensure_ascii=True, indent=2), file=sys.stderr)
+        emit_json(_build_failure(
+            alias=args.alias,
+            code='target_resolution_error',
+            message=f'File not found: {e}',
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
         sys.exit(1)
     except ValueError as e:
-        print(json.dumps({
-            'success': False,
-            'error': f'Invalid alias: {e}'
-        }, ensure_ascii=True, indent=2), file=sys.stderr)
+        emit_json(_build_failure(
+            alias=args.alias,
+            code='cli_argument_error',
+            message=f'Invalid alias: {e}',
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
         sys.exit(1)
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': f'Upload error: {e}'
-        }, ensure_ascii=True, indent=2), file=sys.stderr)
+        emit_json(_build_failure(
+            alias=args.alias,
+            code='internal_error',
+            message=f'Upload error: {e}',
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
         sys.exit(1)
 
 

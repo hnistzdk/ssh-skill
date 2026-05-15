@@ -99,7 +99,7 @@ python ~/.claude/skills/ssh-skill/scripts/ssh_config_manager_v3.py list-servers
 **配置管理：**
 - 配置文件位置：`~/.ssh/config`
 - 使用标准 OpenSSH 格式 + 注释元数据
-- 支持密钥认证和密码认证
+- 支持密钥认证、运行时密码认证和持久化密码认证
 - 支持 ProxyJump 跳板机配置
 
 **性能对比：**
@@ -306,7 +306,6 @@ python ssh_tunnel.py start prod-web-01 --remote-port 8080
 # environment: production
 # tags: web,nginx,production
 # location: 阿里云-北京
-# password:
 # created_at: 2026-03-01 12:00:00
 # updated_at: 2026-03-01 12:00:00
 Host prod-web-01
@@ -318,7 +317,15 @@ Host prod-web-01
 
 ### 密码认证配置
 
-密码存储在注释中（SSH config 不原生支持密码字段）：
+支持两种密码来源，优先级如下：
+1. 环境变量（优先覆盖）
+2. SSH config 注释中的持久化密码 `# password:`
+
+```bash
+export SSH_SKILL_PASSWORD_DEV_SERVER='your-password'
+# 或
+export SSH_PASSWORD_DEV_SERVER='your-password'
+```
 
 ```ssh-config
 # ===== dev-server =====

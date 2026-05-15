@@ -45,11 +45,13 @@ import tempfile
 import argparse
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, Dict, List
 
 # 添加 lib 到路径
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_script_dir, 'lib'))
+from reporting import add_reporting_arguments, emit_json, verbose_details
 
 
 # === 常量 ===
@@ -59,6 +61,141 @@ HEARTBEAT_INTERVAL = 60  # 60 秒心跳检测
 RECONNECT_MAX_RETRIES = 3
 AUTO_PORT_START = 10000  # 自动分配端口起始值
 AUTO_PORT_END = 20000    # 自动分配端口结束值
+
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_response(action, target, success, result=None, error=None, mode=None):
+    payload = {
+        'schema_version': '1.0',
+        'success': success,
+        'operation': 'tunnel',
+        'action': action,
+        'target': target,
+        'mode': mode,
+        'error': error,
+    }
+    if result is not None:
+        payload['result'] = result
+    return payload
+
+
+def _build_failure(action, target, code, message, details=None, cause=None, retriable=False, mode=None, result=None):
+    return _build_response(
+        action=action,
+        target=target,
+        success=False,
+        result=result,
+        mode=mode,
+        error=_build_error(code, message, details=details, cause=cause, retriable=retriable),
+    )
+
+
+def _reporting_details(args, **details):
+    return verbose_details(args, **details)
+
+
+def _with_reporting(result, args, **details):
+    reporting = _reporting_details(args, **details)
+    if not reporting:
+        return result
+
+    payload = dict(result or {})
+    existing_reporting = payload.get('reporting')
+    if isinstance(existing_reporting, dict):
+        merged_reporting = dict(existing_reporting)
+        merged_reporting.update(reporting)
+        payload['reporting'] = merged_reporting
+    else:
+        payload['reporting'] = reporting
+    return payload
+
+
+def _default_reporting_args():
+    return SimpleNamespace(json=True, quiet=False, verbose=True)
+
+
+class TunnelStartupError(RuntimeError):
+    def __init__(self, code, message, details=None, cause=None, retriable=False):
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+        self.cause = cause
+        self.retriable = retriable
+
+    def to_error(self, tunnel=None):
+        details = {}
+        if tunnel is not None:
+            details.update({
+                'alias': tunnel.alias,
+                'local_port': tunnel.local_port,
+                'remote_host': tunnel.remote_host,
+                'remote_port': tunnel.remote_port,
+            })
+        details.update(self.details)
+        return _build_error(
+            self.code,
+            str(self),
+            details=details,
+            cause=self.cause,
+            retriable=self.retriable,
+        )
+
+
+def _adapt_daemon_payload_for_args(payload, args):
+    if getattr(args, 'verbose', False):
+        return payload
+
+    adapted = dict(payload)
+    result = adapted.get('result')
+    if isinstance(result, dict) and 'reporting' in result:
+        result = dict(result)
+        result.pop('reporting', None)
+        adapted['result'] = result
+    return adapted
+
+
+def _daemon_reporting_details(tunnel, **details):
+    payload = {
+        'tunnel_id': tunnel.tunnel_id,
+        'alias': tunnel.alias,
+        'local_port': tunnel.local_port,
+        'remote_host': tunnel.remote_host,
+        'remote_port': tunnel.remote_port,
+        'ssh_host': tunnel._get_ssh_host_info(),
+    }
+    for key, value in details.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _write_daemon_startup_status(tunnel, success, error=None, **details):
+    message = details.pop('message', None)
+    result = _with_reporting({
+        'tunnel_id': tunnel.tunnel_id,
+        'local_port': tunnel.local_port,
+        'remote_host': tunnel.remote_host,
+        'remote_port': tunnel.remote_port,
+        **({'message': message} if message is not None else {}),
+    }, _default_reporting_args(), **_daemon_reporting_details(tunnel, **details))
+    payload = _build_response(
+        action='start',
+        target=tunnel.tunnel_id,
+        success=success,
+        mode='daemon',
+        result=result,
+        error=error,
+    )
+    write_tunnel_startup_status(tunnel.tunnel_id, payload)
 
 
 def get_tunnel_id(alias: str, local_port: int) -> str:
@@ -72,6 +209,45 @@ def get_tunnel_info_path(tunnel_id: str) -> str:
     # 使用 MD5 避免特殊字符问题
     safe_id = hashlib.md5(tunnel_id.encode('utf-8')).hexdigest()[:16]
     return os.path.join(TUNNEL_DIR, f'{safe_id}.json')
+
+
+def get_tunnel_startup_status_path(tunnel_id: str) -> str:
+    """获取 tunnel 启动状态文件路径"""
+    os.makedirs(TUNNEL_DIR, exist_ok=True)
+    safe_id = hashlib.md5(tunnel_id.encode('utf-8')).hexdigest()[:16]
+    return os.path.join(TUNNEL_DIR, f'{safe_id}.startup.json')
+
+
+def clear_tunnel_startup_status(tunnel_id: str):
+    """清理 tunnel 启动状态文件"""
+    status_path = get_tunnel_startup_status_path(tunnel_id)
+    if os.path.exists(status_path):
+        os.remove(status_path)
+
+
+def write_tunnel_startup_status(tunnel_id: str, payload: Dict):
+    """写入 tunnel 启动状态"""
+    status_path = get_tunnel_startup_status_path(tunnel_id)
+    with open(status_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def read_tunnel_startup_status(tunnel_id: str) -> Optional[Dict]:
+    """读取 tunnel 启动状态，返回后自动清理"""
+    status_path = get_tunnel_startup_status_path(tunnel_id)
+    if not os.path.exists(status_path):
+        return None
+    try:
+        with open(status_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+    finally:
+        try:
+            if os.path.exists(status_path):
+                os.remove(status_path)
+        except Exception:
+            pass
 
 
 def read_tunnel_info(tunnel_id: str) -> Optional[Dict]:
@@ -100,7 +276,7 @@ def list_all_tunnels() -> List[Dict]:
         return tunnels
 
     for filename in os.listdir(TUNNEL_DIR):
-        if not filename.endswith('.json'):
+        if not filename.endswith('.json') or filename.endswith('.startup.json'):
             continue
         try:
             filepath = os.path.join(TUNNEL_DIR, filename)
@@ -178,84 +354,131 @@ class SSHTunnel:
 
     def start(self):
         """启动 tunnel 守护进程"""
-        # 加载 SSH 配置
-        self._load_config()
-
-        # 建立 SSH 连接
-        self._connect_ssh()
-
-        # 启动本地监听
-        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_socket.bind(('127.0.0.1', self.local_port))
-        self._server_socket.listen(5)
-        self._server_socket.settimeout(5.0)
-
-        self._running = True
-
-        # 写入 tunnel 信息
-        info = {
-            'pid': os.getpid(),
-            'tunnel_id': self.tunnel_id,
-            'alias': self.alias,
-            'local_port': self.local_port,
-            'remote_host': self.remote_host,
-            'remote_port': self.remote_port,
-            'ssh_host': self._get_ssh_host_info(),
-            'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-            'idle_timeout': self.idle_timeout
-        }
-        info_path = get_tunnel_info_path(self.tunnel_id)
-        with open(info_path, 'w', encoding='utf-8') as f:
-            json.dump(info, f, ensure_ascii=False, indent=2)
-
-        # 输出启动信息
-        print(json.dumps({
-            'success': True,
-            'tunnel_id': self.tunnel_id,
-            'local_port': self.local_port,
-            'remote_host': self.remote_host,
-            'remote_port': self.remote_port,
-            'message': f'Tunnel started: 127.0.0.1:{self.local_port} -> {self.remote_host}:{self.remote_port}'
-        }, ensure_ascii=False))
-        sys.stdout.flush()
-
-        # 启动心跳线程
-        heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        heartbeat_thread.start()
-
-        # 启动空闲检测线程
-        idle_thread = threading.Thread(target=self._idle_check_loop, daemon=True)
-        idle_thread.start()
-
-        # 主循环：接受连接并转发
+        clear_tunnel_startup_status(self.tunnel_id)
         try:
-            while self._running:
-                try:
-                    client_sock, addr = self._server_socket.accept()
-                    self._last_activity = time.time()
-                    t = threading.Thread(
-                        target=self._handle_tunnel,
-                        args=(client_sock,),
-                        daemon=True
-                    )
-                    t.start()
-                except socket.timeout:
-                    continue
-                except OSError:
-                    if self._running:
-                        raise
-                    break
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self._shutdown()
+            # 加载 SSH 配置
+            self._load_config()
+
+            # 建立 SSH 连接
+            self._connect_ssh()
+
+            # 启动本地监听
+            self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self._server_socket.bind(('127.0.0.1', self.local_port))
+                self._server_socket.listen(5)
+                self._server_socket.settimeout(5.0)
+            except OSError as e:
+                raise TunnelStartupError(
+                    'connection_error',
+                    f'本地端口 {self.local_port} 监听失败',
+                    details={'bind_address': '127.0.0.1', 'local_port': self.local_port},
+                    cause=str(e),
+                    retriable=False,
+                ) from e
+
+            self._running = True
+
+            # 写入 tunnel 信息
+            info = {
+                'pid': os.getpid(),
+                'tunnel_id': self.tunnel_id,
+                'alias': self.alias,
+                'local_port': self.local_port,
+                'remote_host': self.remote_host,
+                'remote_port': self.remote_port,
+                'ssh_host': self._get_ssh_host_info(),
+                'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'idle_timeout': self.idle_timeout
+            }
+            info_path = get_tunnel_info_path(self.tunnel_id)
+            with open(info_path, 'w', encoding='utf-8') as f:
+                json.dump(info, f, ensure_ascii=False, indent=2)
+
+            _write_daemon_startup_status(
+                self,
+                True,
+                message=f'Tunnel started: 127.0.0.1:{self.local_port} -> {self.remote_host}:{self.remote_port}',
+                started_at=info['started_at'],
+                idle_timeout=self.idle_timeout,
+                pid=os.getpid(),
+            )
+
+            # 启动心跳线程
+            heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            heartbeat_thread.start()
+
+            # 启动空闲检测线程
+            idle_thread = threading.Thread(target=self._idle_check_loop, daemon=True)
+            idle_thread.start()
+
+            # 主循环：接受连接并转发
+            try:
+                while self._running:
+                    try:
+                        client_sock, addr = self._server_socket.accept()
+                        self._last_activity = time.time()
+                        t = threading.Thread(
+                            target=self._handle_tunnel,
+                            args=(client_sock,),
+                            daemon=True
+                        )
+                        t.start()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        if self._running:
+                            raise
+                        break
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self._shutdown()
+        except TunnelStartupError as e:
+            _write_daemon_startup_status(self, False, error=e.to_error(self), phase='startup')
+            raise
+        except Exception as e:
+            _write_daemon_startup_status(
+                self,
+                False,
+                error=_build_error(
+                    'internal_error',
+                    f'Tunnel 启动失败: {e}',
+                    details={
+                        'alias': self.alias,
+                        'local_port': self.local_port,
+                        'remote_host': self.remote_host,
+                        'remote_port': self.remote_port,
+                    },
+                    cause=str(e),
+                    retriable=False,
+                ),
+                phase='startup',
+            )
+            raise
 
     def _load_config(self):
         """从 SSH config 加载连接参数"""
         from config_v3 import SSHConfigLoaderV3
-        loader = SSHConfigLoaderV3()
-        self._connection_params = loader.get_connection_params(self.alias)
+
+        try:
+            loader = SSHConfigLoaderV3()
+            self._connection_params = loader.get_connection_params(self.alias)
+        except FileNotFoundError as e:
+            raise TunnelStartupError(
+                'target_resolution_error',
+                f'加载 SSH 配置失败: {e}',
+                cause=str(e),
+                retriable=False,
+            ) from e
+        except ValueError as e:
+            raise TunnelStartupError(
+                'target_resolution_error',
+                f'无效的 SSH 别名: {e}',
+                cause=str(e),
+                retriable=False,
+            ) from e
 
     def _get_ssh_host_info(self) -> str:
         """获取 SSH 服务器信息"""
@@ -271,7 +494,11 @@ class SSHTunnel:
 
         params = self._connection_params
         if not params:
-            raise ValueError("连接参数未加载")
+            raise TunnelStartupError(
+                'internal_error',
+                '连接参数未加载',
+                retriable=False,
+            )
 
         host = params['hostname']
         user = params['user']
@@ -316,19 +543,60 @@ class SSHTunnel:
                     ) if proxy_client else None
                 )
             else:
-                raise ValueError("未配置认证方式（密码或密钥）")
+                raise TunnelStartupError(
+                    'auth_error',
+                    '未配置认证方式（密码或密钥）',
+                    retriable=False,
+                )
+        except TunnelStartupError:
+            if self._ssh_client:
+                self._ssh_client.close()
+            raise
+        except paramiko.AuthenticationException as e:
+            if self._ssh_client:
+                self._ssh_client.close()
+            raise TunnelStartupError(
+                'auth_error',
+                f'SSH 认证失败: {e}',
+                details={'ssh_host': f'{user}@{host}:{port}'},
+                cause=str(e),
+                retriable=False,
+            ) from e
         except Exception as e:
             if self._ssh_client:
                 self._ssh_client.close()
-            raise RuntimeError(f"SSH 连接失败: {e}")
+            raise TunnelStartupError(
+                'connection_error',
+                f'SSH 连接失败: {e}',
+                details={'ssh_host': f'{user}@{host}:{port}'},
+                cause=str(e),
+                retriable=False,
+            ) from e
 
     def _create_proxy_client(self, proxy_jump: str):
         """创建跳板机连接"""
         import paramiko
         from config_v3 import SSHConfigLoaderV3
 
-        loader = SSHConfigLoaderV3()
-        proxy_params = loader.get_connection_params(proxy_jump)
+        try:
+            loader = SSHConfigLoaderV3()
+            proxy_params = loader.get_connection_params(proxy_jump)
+        except FileNotFoundError as e:
+            raise TunnelStartupError(
+                'target_resolution_error',
+                f'加载跳板机配置失败: {e}',
+                details={'proxy_jump': proxy_jump},
+                cause=str(e),
+                retriable=False,
+            ) from e
+        except ValueError as e:
+            raise TunnelStartupError(
+                'target_resolution_error',
+                f'无效的跳板机别名: {e}',
+                details={'proxy_jump': proxy_jump},
+                cause=str(e),
+                retriable=False,
+            ) from e
 
         proxy_client = paramiko.SSHClient()
         proxy_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -342,24 +610,51 @@ class SSHTunnel:
         if proxy_key:
             proxy_key = os.path.expanduser(proxy_key)
 
-        if proxy_password:
-            proxy_client.connect(
-                hostname=proxy_host,
-                port=proxy_port,
-                username=proxy_user,
-                password=proxy_password,
-                timeout=30
-            )
-        elif proxy_key:
-            proxy_client.connect(
-                hostname=proxy_host,
-                port=proxy_port,
-                username=proxy_user,
-                key_filename=proxy_key,
-                timeout=30
-            )
-        else:
-            raise ValueError(f"跳板机 {proxy_jump} 未配置认证方式")
+        try:
+            if proxy_password:
+                proxy_client.connect(
+                    hostname=proxy_host,
+                    port=proxy_port,
+                    username=proxy_user,
+                    password=proxy_password,
+                    timeout=30
+                )
+            elif proxy_key:
+                proxy_client.connect(
+                    hostname=proxy_host,
+                    port=proxy_port,
+                    username=proxy_user,
+                    key_filename=proxy_key,
+                    timeout=30
+                )
+            else:
+                raise TunnelStartupError(
+                    'auth_error',
+                    f'跳板机 {proxy_jump} 未配置认证方式',
+                    details={'proxy_jump': proxy_jump, 'ssh_host': f'{proxy_user}@{proxy_host}:{proxy_port}'},
+                    retriable=False,
+                )
+        except TunnelStartupError:
+            proxy_client.close()
+            raise
+        except paramiko.AuthenticationException as e:
+            proxy_client.close()
+            raise TunnelStartupError(
+                'auth_error',
+                f'跳板机认证失败: {e}',
+                details={'proxy_jump': proxy_jump, 'ssh_host': f'{proxy_user}@{proxy_host}:{proxy_port}'},
+                cause=str(e),
+                retriable=False,
+            ) from e
+        except Exception as e:
+            proxy_client.close()
+            raise TunnelStartupError(
+                'connection_error',
+                f'跳板机连接失败: {e}',
+                details={'proxy_jump': proxy_jump, 'ssh_host': f'{proxy_user}@{proxy_host}:{proxy_port}'},
+                cause=str(e),
+                retriable=False,
+            ) from e
 
         return proxy_client
 
@@ -515,22 +810,32 @@ def cmd_start(args):
     if not local_port:
         local_port = find_available_port()
         if not local_port:
-            print(json.dumps({
-                'success': False,
-                'error': '无法找到可用的本地端口'
-            }, ensure_ascii=False))
+            emit_json(_build_failure(
+                action='start',
+                target=alias,
+                code='connection_error',
+                message='无法找到可用的本地端口',
+                details={'alias': alias, 'remote_host': remote_host, 'remote_port': remote_port},
+                retriable=False,
+            ), args=args, ensure_ascii=False)
             return 1
 
     tunnel_id = get_tunnel_id(alias, local_port)
+    clear_tunnel_startup_status(tunnel_id)
 
     # 检查是否已存在
     existing = read_tunnel_info(tunnel_id)
     if existing:
-        print(json.dumps({
-            'success': False,
-            'error': f'Tunnel 已存在: {tunnel_id}',
-            'tunnel_info': existing
-        }, ensure_ascii=False))
+        emit_json(_build_failure(
+            action='start',
+            target=tunnel_id,
+            code='cli_argument_error',
+            message=f'Tunnel 已存在: {tunnel_id}',
+            details={'alias': alias, 'local_port': local_port, 'remote_host': remote_host, 'remote_port': remote_port},
+            cause=tunnel_id,
+            retriable=False,
+            result=_with_reporting({'tunnel_info': existing}, args, alias=alias, local_port=local_port, remote_host=remote_host, remote_port=remote_port, action='start'),
+        ), args=args, ensure_ascii=False)
         return 1
 
     # 检查端口是否被占用
@@ -539,10 +844,15 @@ def cmd_start(args):
         sock.bind(('127.0.0.1', local_port))
         sock.close()
     except OSError:
-        print(json.dumps({
-            'success': False,
-            'error': f'本地端口 {local_port} 已被占用'
-        }, ensure_ascii=False))
+        emit_json(_build_failure(
+            action='start',
+            target=tunnel_id,
+            code='connection_error',
+            message=f'本地端口 {local_port} 已被占用',
+            details={'alias': alias, 'local_port': local_port, 'remote_host': remote_host, 'remote_port': remote_port},
+            cause=str(local_port),
+            retriable=False,
+        ), args=args, ensure_ascii=False)
         return 1
 
     # 启动守护进程
@@ -572,24 +882,72 @@ def cmd_start(args):
     # 等待守护进程启动
     time.sleep(2)
 
+    startup_status = read_tunnel_startup_status(tunnel_id)
+
     # 验证启动成功
     info = read_tunnel_info(tunnel_id)
     if info:
-        print(json.dumps({
-            'success': True,
-            'tunnel_id': tunnel_id,
-            'local_port': local_port,
-            'remote_host': remote_host,
-            'remote_port': remote_port,
-            'message': f'Tunnel 已启动: 127.0.0.1:{local_port} -> {remote_host}:{remote_port}'
-        }, ensure_ascii=False))
+        payload = startup_status if isinstance(startup_status, dict) else _build_response(
+            action='start',
+            target=tunnel_id,
+            success=True,
+            mode='daemon',
+            result={
+                'tunnel_id': tunnel_id,
+                'local_port': local_port,
+                'remote_host': remote_host,
+                'remote_port': remote_port,
+                'message': f'Tunnel 已启动: 127.0.0.1:{local_port} -> {remote_host}:{remote_port}',
+                'tunnel_info': info,
+            },
+        )
+
+        result = dict(payload.get('result') or {})
+        result['tunnel_info'] = info
+        payload['result'] = _with_reporting(
+            result,
+            args,
+            alias=alias,
+            local_port=local_port,
+            remote_host=remote_host,
+            remote_port=remote_port,
+            action='start',
+            tunnel_id=tunnel_id,
+        )
+        payload['target'] = tunnel_id
+        payload['mode'] = payload.get('mode') or 'daemon'
+
+        emit_json(_adapt_daemon_payload_for_args(payload, args), args=args, ensure_ascii=False)
         return 0
-    else:
-        print(json.dumps({
-            'success': False,
-            'error': 'Tunnel 启动失败，请检查日志'
-        }, ensure_ascii=False))
-        return 1
+
+    if isinstance(startup_status, dict):
+        payload = _adapt_daemon_payload_for_args(startup_status, args)
+        payload['target'] = tunnel_id
+        payload['mode'] = payload.get('mode') or 'daemon'
+        result = payload.get('result') or {}
+        payload['result'] = _with_reporting(
+            result,
+            args,
+            alias=alias,
+            local_port=local_port,
+            remote_host=remote_host,
+            remote_port=remote_port,
+            action='start',
+            tunnel_id=tunnel_id,
+        )
+        emit_json(payload, args=args, ensure_ascii=False)
+        return 0 if payload.get('success') else 1
+
+    emit_json(_build_failure(
+        action='start',
+        target=tunnel_id,
+        code='transport_error',
+        message='Tunnel 启动失败，请检查日志',
+        details={'alias': alias, 'local_port': local_port, 'remote_host': remote_host, 'remote_port': remote_port},
+        retriable=False,
+        mode='daemon',
+    ), args=args, ensure_ascii=False)
+    return 1
 
 
 def cmd_daemon(args):
@@ -608,22 +966,30 @@ def cmd_list(args):
     tunnels = list_all_tunnels()
 
     if not tunnels:
-        print(json.dumps({
-            'success': True,
-            'tunnels': [],
-            'count': 0,
-            'message': '没有活动的 tunnel'
-        }, ensure_ascii=False))
+        emit_json(_build_response(
+            action='list',
+            target='all',
+            success=True,
+            result=_with_reporting({
+                'tunnels': [],
+                'count': 0,
+                'message': '没有活动的 tunnel'
+            }, args, action='list', count=0)
+        ), args=args, ensure_ascii=False)
         return 0
 
     # 按别名和端口排序
     tunnels.sort(key=lambda t: (t.get('alias', ''), t.get('local_port', 0)))
 
-    print(json.dumps({
-        'success': True,
-        'tunnels': tunnels,
-        'count': len(tunnels)
-    }, ensure_ascii=False, indent=2))
+    emit_json(_build_response(
+        action='list',
+        target='all',
+        success=True,
+        result=_with_reporting({
+            'tunnels': tunnels,
+            'count': len(tunnels)
+        }, args, action='list', count=len(tunnels))
+    ), args=args, ensure_ascii=False)
     return 0
 
 
@@ -633,16 +999,23 @@ def cmd_status(args):
     info = read_tunnel_info(tunnel_id)
 
     if not info:
-        print(json.dumps({
-            'success': False,
-            'error': f'Tunnel 不存在: {tunnel_id}'
-        }, ensure_ascii=False))
+        emit_json(_build_failure(
+            action='status',
+            target=tunnel_id,
+            code='target_resolution_error',
+            message=f'Tunnel 不存在: {tunnel_id}',
+            details={'tunnel_id': tunnel_id},
+            cause=tunnel_id,
+            retriable=False,
+        ), args=args, ensure_ascii=False)
         return 1
 
-    print(json.dumps({
-        'success': True,
-        'tunnel_info': info
-    }, ensure_ascii=False, indent=2))
+    emit_json(_build_response(
+        action='status',
+        target=tunnel_id,
+        success=True,
+        result=_with_reporting({'tunnel_info': info}, args, action='status', tunnel_id=tunnel_id)
+    ), args=args, ensure_ascii=False)
     return 0
 
 
@@ -652,18 +1025,28 @@ def cmd_stop(args):
     info = read_tunnel_info(tunnel_id)
 
     if not info:
-        print(json.dumps({
-            'success': False,
-            'error': f'Tunnel 不存在: {tunnel_id}'
-        }, ensure_ascii=False))
+        emit_json(_build_failure(
+            action='stop',
+            target=tunnel_id,
+            code='target_resolution_error',
+            message=f'Tunnel 不存在: {tunnel_id}',
+            details={'tunnel_id': tunnel_id},
+            cause=tunnel_id,
+            retriable=False,
+        ), args=args, ensure_ascii=False)
         return 1
 
     pid = info.get('pid')
     if not pid:
-        print(json.dumps({
-            'success': False,
-            'error': 'Tunnel 信息中缺少 PID'
-        }, ensure_ascii=False))
+        emit_json(_build_failure(
+            action='stop',
+            target=tunnel_id,
+            code='internal_error',
+            message='Tunnel 信息中缺少 PID',
+            details={'tunnel_id': tunnel_id, 'tunnel_info': info},
+            retriable=False,
+            result=_with_reporting({'tunnel_info': info}, args, action='stop', tunnel_id=tunnel_id),
+        ), args=args, ensure_ascii=False)
         return 1
 
     # 终止进程
@@ -688,17 +1071,28 @@ def cmd_stop(args):
         if os.path.exists(info_path):
             os.remove(info_path)
 
-        print(json.dumps({
-            'success': True,
-            'message': f'Tunnel 已停止: {tunnel_id}'
-        }, ensure_ascii=False))
+        emit_json(_build_response(
+            action='stop',
+            target=tunnel_id,
+            success=True,
+            result=_with_reporting({
+                'message': f'Tunnel 已停止: {tunnel_id}',
+                'tunnel_info': info,
+            }, args, action='stop', tunnel_id=tunnel_id, pid=pid)
+        ), args=args, ensure_ascii=False)
         return 0
 
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': f'停止 tunnel 失败: {e}'
-        }, ensure_ascii=False))
+        emit_json(_build_failure(
+            action='stop',
+            target=tunnel_id,
+            code='transport_error',
+            message=f'停止 tunnel 失败: {e}',
+            details={'tunnel_id': tunnel_id, 'pid': pid},
+            cause=str(e),
+            retriable=False,
+            result=_with_reporting({'tunnel_info': info}, args, action='stop', tunnel_id=tunnel_id, pid=pid),
+        ), args=args, ensure_ascii=False)
         return 1
 
 
@@ -711,11 +1105,16 @@ def cmd_stop_all(args):
     target_tunnels = [t for t in tunnels if t.get('alias') == alias]
 
     if not target_tunnels:
-        print(json.dumps({
-            'success': True,
-            'message': f'没有找到服务器 {alias} 的 tunnel',
-            'stopped': 0
-        }, ensure_ascii=False))
+        emit_json(_build_response(
+            action='stop-all',
+            target=alias,
+            success=True,
+            result=_with_reporting({
+                'message': f'没有找到服务器 {alias} 的 tunnel',
+                'stopped': 0,
+                'failed': 0,
+            }, args, action='stop-all', alias=alias, stopped=0, failed=0)
+        ), args=args, ensure_ascii=False)
         return 0
 
     stopped = 0
@@ -745,12 +1144,16 @@ def cmd_stop_all(args):
         except Exception:
             failed += 1
 
-    print(json.dumps({
-        'success': True,
-        'message': f'已停止 {stopped} 个 tunnel',
-        'stopped': stopped,
-        'failed': failed
-    }, ensure_ascii=False))
+    emit_json(_build_response(
+        action='stop-all',
+        target=alias,
+        success=True,
+        result=_with_reporting({
+            'message': f'已停止 {stopped} 个 tunnel',
+            'stopped': stopped,
+            'failed': failed
+        }, args, action='stop-all', alias=alias, stopped=stopped, failed=failed)
+    ), args=args, ensure_ascii=False)
     return 0
 
 
@@ -768,25 +1171,30 @@ def main():
     parser_start.add_argument('--local-port', type=int, help='本地端口（不指定则自动分配）')
     parser_start.add_argument('--remote-port', type=int, required=True, help='远程端口')
     parser_start.add_argument('--remote-host', default='localhost', help='远程主机（默认 localhost）')
+    add_reporting_arguments(parser_start)
     parser_start.set_defaults(func=cmd_start)
 
     # list 命令
     parser_list = subparsers.add_parser('list', help='列出所有活动的 tunnel')
+    add_reporting_arguments(parser_list)
     parser_list.set_defaults(func=cmd_list)
 
     # status 命令
     parser_status = subparsers.add_parser('status', help='查看 tunnel 状态')
     parser_status.add_argument('tunnel_id', help='Tunnel ID')
+    add_reporting_arguments(parser_status)
     parser_status.set_defaults(func=cmd_status)
 
     # stop 命令
     parser_stop = subparsers.add_parser('stop', help='停止 tunnel')
     parser_stop.add_argument('tunnel_id', help='Tunnel ID')
+    add_reporting_arguments(parser_stop)
     parser_stop.set_defaults(func=cmd_stop)
 
     # stop-all 命令
     parser_stop_all = subparsers.add_parser('stop-all', help='停止服务器的所有 tunnel')
     parser_stop_all.add_argument('alias', help='服务器别名')
+    add_reporting_arguments(parser_stop_all)
     parser_stop_all.set_defaults(func=cmd_stop_all)
 
     # _daemon 命令（内部使用）

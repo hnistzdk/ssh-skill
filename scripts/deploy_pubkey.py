@@ -19,6 +19,45 @@ if sys.platform == 'win32':
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_script_dir, 'lib'))
 
+from reporting import add_reporting_arguments, emit_json, verbose_details
+
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(operation, target, code, message, details=None, cause=None, retriable=False, mode='remote'):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
+
+
+def _build_success(operation, target, result, mode='remote', args=None, **details):
+    payload = dict(result)
+    reporting = verbose_details(args, **details)
+    if reporting:
+        payload['reporting'] = reporting
+    return {
+        'schema_version': '1.0',
+        'success': True,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'result': payload,
+        'error': None,
+    }
+
 
 def deploy_pubkey(alias, pubkey_content, key_name):
     """
@@ -30,21 +69,22 @@ def deploy_pubkey(alias, pubkey_content, key_name):
         key_name: 密钥名称（用于标识）
 
     Returns:
-        bool: 是否成功
+        dict: 执行结果
     """
     from config_v3 import SSHConfigLoaderV3
 
     try:
-        # 加载配置
         loader = SSHConfigLoaderV3()
         params = loader.get_connection_params(alias)
 
-        # 检查是否有密码
         if not params.get('password'):
-            print(f"错误: {alias} 没有配置密码，无法使用密码认证部署公钥")
-            return False
+            return {
+                'success': False,
+                'code': 'auth_error',
+                'message': f'{alias} 没有配置密码，无法使用密码认证部署公钥',
+                'details': {'alias': alias},
+            }
 
-        # 使用密码认证创建客户端
         from paramiko_client import ParamikoClient
         client = ParamikoClient(
             host=params['hostname'],
@@ -54,29 +94,48 @@ def deploy_pubkey(alias, pubkey_content, key_name):
             timeout=30
         )
 
-        print(f"正在连接到 {alias}...")
+        steps = [{'step': 'connect', 'message': f'正在连接到 {alias}'}]
 
-        # 测试连接
         result = client.execute("echo 'Connection OK'")
         if not result.success:
-            print(f"错误: 无法连接到 {alias}")
-            return False
+            return {
+                'success': False,
+                'code': 'connection_error',
+                'message': f'无法连接到 {alias}',
+                'details': {
+                    'alias': alias,
+                    'stderr': result.stderr,
+                },
+                'cause': result.stderr or None,
+            }
 
-        print("连接成功，开始部署公钥...")
+        steps.append({'step': 'connect', 'message': '连接成功，开始部署公钥...'})
 
-        # 创建 .ssh 目录（如果不存在）
         result = client.execute("mkdir -p ~/.ssh && chmod 700 ~/.ssh")
         if not result.success:
-            print(f"错误: 无法创建 .ssh 目录")
-            return False
+            return {
+                'success': False,
+                'code': 'transport_error',
+                'message': '无法创建 .ssh 目录',
+                'details': {
+                    'alias': alias,
+                    'stderr': result.stderr,
+                },
+                'cause': result.stderr or None,
+            }
 
-        # 检查公钥是否已存在
         result = client.execute(f"grep -F '{pubkey_content.strip()}' ~/.ssh/authorized_keys 2>/dev/null")
         if result.success and result.stdout.strip():
-            print(f"公钥已存在于 {alias}，无需重复添加")
-            return True
+            return {
+                'success': True,
+                'message': f'公钥已存在于 {alias}，无需重复添加',
+                'alias': alias,
+                'key_name': key_name,
+                'changed': False,
+                'verification': 'skipped',
+                'steps': steps,
+            }
 
-        # 追加公钥到 authorized_keys
         escaped_pubkey = pubkey_content.strip().replace("'", "'\\''")
         result = client.execute(
             f"echo '{escaped_pubkey}' >> ~/.ssh/authorized_keys && "
@@ -84,56 +143,110 @@ def deploy_pubkey(alias, pubkey_content, key_name):
         )
 
         if not result.success:
-            print(f"错误: 无法写入公钥到 authorized_keys")
-            print(f"错误信息: {result.stderr}")
-            return False
+            return {
+                'success': False,
+                'code': 'transport_error',
+                'message': '无法写入公钥到 authorized_keys',
+                'details': {
+                    'alias': alias,
+                    'stderr': result.stderr,
+                },
+                'cause': result.stderr or None,
+            }
 
-        print(f"✓ 公钥已成功部署到 {alias}")
+        steps.append({'step': 'write_authorized_keys', 'message': f'公钥已成功部署到 {alias}'})
+        steps.append({'step': 'verify_key_auth', 'message': '验证步骤已跳过，需用户手动测试'})
 
-        # 验证密钥认证是否工作
-        print("正在验证密钥认证...")
-        # 这里需要使用新的密钥文件测试连接
-        # 暂时跳过验证，由用户手动测试
-
-        return True
+        return {
+            'success': True,
+            'message': f'现在可以使用密钥 {key_name} 连接到 {alias}',
+            'alias': alias,
+            'key_name': key_name,
+            'changed': True,
+            'verification': 'skipped',
+            'next_step': '使用 migrate_to_key_auth.py 更新 SSH config',
+            'steps': steps,
+        }
 
     except Exception as e:
-        print(f"错误: {str(e)}")
-        return False
+        return {
+            'success': False,
+            'code': 'internal_error',
+            'message': str(e),
+            'details': {
+                'alias': alias,
+                'key_name': key_name,
+            },
+            'cause': str(e),
+        }
 
 
 def main():
     parser = argparse.ArgumentParser(description='部署公钥到远程服务器')
+    add_reporting_arguments(parser)
     parser.add_argument('alias', help='服务器别名')
     parser.add_argument('--pubkey-file', required=True, help='公钥文件路径')
     parser.add_argument('--key-name', required=True, help='密钥名称（如 id_rsa_sa_legacy）')
 
     args = parser.parse_args()
+    operation = 'deploy_pubkey'
 
-    # 读取公钥内容
     pubkey_file = os.path.expanduser(args.pubkey_file)
     if not os.path.exists(pubkey_file):
-        print(f"错误: 公钥文件不存在: {pubkey_file}")
-        sys.exit(1)
+        emit_json(_build_failure(
+            operation=operation,
+            target=args.alias,
+            code='target_resolution_error',
+            message=f'公钥文件不存在: {pubkey_file}',
+            details={'pubkey_file': pubkey_file, 'alias': args.alias},
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
     with open(pubkey_file, 'r', encoding='utf-8') as f:
         pubkey_content = f.read().strip()
 
     if not pubkey_content:
-        print(f"错误: 公钥文件为空")
-        sys.exit(1)
+        emit_json(_build_failure(
+            operation=operation,
+            target=args.alias,
+            code='cli_argument_error',
+            message='公钥文件为空',
+            details={'pubkey_file': pubkey_file, 'alias': args.alias},
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
-    # 部署公钥
-    success = deploy_pubkey(args.alias, pubkey_content, args.key_name)
+    result = deploy_pubkey(args.alias, pubkey_content, args.key_name)
 
-    if success:
-        print(f"\n成功！现在可以使用密钥 {args.key_name} 连接到 {args.alias}")
-        print(f"建议: 使用 migrate_to_key_auth.py 更新 SSH config")
-        sys.exit(0)
-    else:
-        print(f"\n失败: 无法部署公钥到 {args.alias}")
-        sys.exit(1)
+    if result.get('success'):
+        emit_json(_build_success(
+            operation=operation,
+            target=args.alias,
+            args=args,
+            result=result,
+            alias=args.alias,
+            key_name=args.key_name,
+            pubkey_file=pubkey_file,
+        ), args=args, ensure_ascii=False)
+        return 0
+
+    emit_json(_build_failure(
+        operation=operation,
+        target=args.alias,
+        code=result.get('code', 'internal_error'),
+        message=result.get('message', f'无法部署公钥到 {args.alias}'),
+        details={
+            'alias': args.alias,
+            'key_name': args.key_name,
+            'pubkey_file': pubkey_file,
+            **result.get('details', {}),
+        },
+        cause=result.get('cause'),
+        retriable=False,
+    ), args=args, stream=sys.stderr, ensure_ascii=False)
+    return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

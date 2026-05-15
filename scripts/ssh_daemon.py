@@ -33,12 +33,52 @@ import traceback
 import argparse
 from pathlib import Path
 
-# 添加 lib 到路径
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_script_dir, 'lib'))
 
+from reporting import add_reporting_arguments, emit_json, verbose_details
 
-# === 常量 ===
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(operation, target, code, message, details=None, cause=None, retriable=False, mode='daemon'):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
+
+
+def _build_success(operation, target, result, mode='daemon', args=None, **details):
+    payload = dict(result)
+    reporting = verbose_details(args or _default_reporting_args(), **details)
+    if reporting:
+        payload['reporting'] = reporting
+    return {
+        'schema_version': '1.0',
+        'success': True,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'result': payload,
+        'error': None,
+    }
+
+
+def _default_reporting_args():
+    return argparse.Namespace(json=True, quiet=False, verbose=False)
+
 DAEMON_DIR = os.path.join(tempfile.gettempdir(), 'ssh_daemon')
 IDLE_TIMEOUT = 1800  # 30 分钟空闲自动退出
 HEARTBEAT_INTERVAL = 60  # 60 秒心跳检测
@@ -177,13 +217,23 @@ class SSHDaemon:
 
         # 输出启动信息到 stdout
         try:
-            print(json.dumps({
-                'status': 'started',
-                'pid': os.getpid(),
-                'port': port,
-                'alias': self.alias,
-                'host': host_info
-            }, ensure_ascii=False))
+            emit_json(_build_success(
+                operation='daemon_start',
+                target=self.alias,
+                mode='daemon',
+                args=_default_reporting_args(),
+                result={
+                    'status': 'started',
+                    'pid': os.getpid(),
+                    'port': port,
+                    'alias': self.alias,
+                    'host': host_info,
+                },
+                alias=self.alias,
+                host=host_info,
+                port=port,
+                idle_timeout=self.idle_timeout,
+            ), args=_default_reporting_args(), ensure_ascii=False)
             sys.stdout.flush()
         except Exception:
             pass  # stdout 不可用（后台进程），忽略
@@ -470,30 +520,78 @@ class SSHDaemon:
 
 # === CLI 入口 ===
 
-def cmd_start(alias: str, idle_timeout: int = IDLE_TIMEOUT):
+def cmd_start(args):
     """启动守护进程"""
-    # 检查是否已有守护进程运行
+    alias = args.alias
     existing = read_daemon_info(alias)
     if existing:
-        print(json.dumps({
-            'status': 'already_running',
-            'pid': existing['pid'],
-            'port': existing['port'],
-            'alias': alias,
-            'host': existing.get('host', 'unknown')
-        }, ensure_ascii=False))
-        return
+        emit_json(_build_success(
+            operation='daemon_start',
+            target=alias,
+            mode='daemon',
+            args=args,
+            result={
+                'status': 'already_running',
+                'pid': existing['pid'],
+                'port': existing['port'],
+                'alias': alias,
+                'host': existing.get('host', 'unknown'),
+            },
+            alias=alias,
+            port=existing.get('port'),
+            host=existing.get('host', 'unknown'),
+            idle_timeout=existing.get('idle_timeout'),
+        ), args=args, ensure_ascii=False)
+        return 0
 
-    daemon = SSHDaemon(alias, idle_timeout)
-    daemon.start()
+    try:
+        daemon = SSHDaemon(alias, args.idle_timeout)
+        daemon.start()
+        return 0
+    except ValueError as e:
+        emit_json(_build_failure(
+            operation='daemon_start',
+            target=alias,
+            code='target_resolution_error',
+            message=str(e),
+            details={
+                'alias': alias,
+                'idle_timeout': args.idle_timeout,
+            },
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
+    except Exception as e:
+        emit_json(_build_failure(
+            operation='daemon_start',
+            target=alias,
+            code='internal_error',
+            message='启动守护进程失败',
+            details={
+                'alias': alias,
+                'idle_timeout': args.idle_timeout,
+            },
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
 
-def cmd_stop(alias: str):
+def cmd_stop(args):
     """停止守护进程"""
+    alias = args.alias
     info = read_daemon_info(alias)
     if not info:
-        print(json.dumps({'status': 'not_running'}, ensure_ascii=False))
-        return
+        emit_json(_build_success(
+            operation='daemon_stop',
+            target=alias,
+            mode='daemon',
+            args=args,
+            result={'status': 'not_running', 'alias': alias},
+            alias=alias,
+        ), args=args, ensure_ascii=False)
+        return 0
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -502,21 +600,52 @@ def cmd_stop(alias: str):
         _send_message(sock, {'action': 'shutdown'})
         resp = _recv_message(sock, timeout=5)
         sock.close()
-        print(json.dumps({'status': 'stopped', **resp}, ensure_ascii=False))
+        emit_json(_build_success(
+            operation='daemon_stop',
+            target=alias,
+            mode='daemon',
+            args=args,
+            result={'status': 'stopped', 'alias': alias, **resp},
+            alias=alias,
+            port=info.get('port'),
+            host=info.get('host'),
+        ), args=args, ensure_ascii=False)
+        return 0
     except Exception as e:
-        # 进程可能已死，清理信息文件
         info_path = get_daemon_info_path(alias)
         if os.path.exists(info_path):
             os.remove(info_path)
-        print(json.dumps({'status': 'force_cleaned', 'error': str(e)}, ensure_ascii=False))
+        emit_json(_build_failure(
+            operation='daemon_stop',
+            target=alias,
+            code='connection_error',
+            message='守护进程不可达，已清理状态文件',
+            details={
+                'alias': alias,
+                'port': info.get('port'),
+                'host': info.get('host'),
+                'status': 'force_cleaned',
+            },
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
 
-def cmd_status(alias: str):
+def cmd_status(args):
     """查询守护进程状态"""
+    alias = args.alias
     info = read_daemon_info(alias)
     if not info:
-        print(json.dumps({'status': 'not_running'}, ensure_ascii=False))
-        return
+        emit_json(_build_success(
+            operation='daemon_status',
+            target=alias,
+            mode='daemon',
+            args=args,
+            result={'status': 'not_running', 'alias': alias},
+            alias=alias,
+        ), args=args, ensure_ascii=False)
+        return 0
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -525,13 +654,37 @@ def cmd_status(alias: str):
         _send_message(sock, {'action': 'ping'})
         resp = _recv_message(sock, timeout=5)
         sock.close()
-        print(json.dumps({'status': 'running', **resp}, ensure_ascii=False))
+        emit_json(_build_success(
+            operation='daemon_status',
+            target=alias,
+            mode='daemon',
+            args=args,
+            result={'status': 'running', **resp},
+            alias=alias,
+            port=info.get('port'),
+            host=info.get('host'),
+        ), args=args, ensure_ascii=False)
+        return 0
     except Exception as e:
-        print(json.dumps({'status': 'unreachable', 'error': str(e)}, ensure_ascii=False))
+        emit_json(_build_failure(
+            operation='daemon_status',
+            target=alias,
+            code='connection_error',
+            message='守护进程状态不可达',
+            details={
+                'alias': alias,
+                'port': info.get('port'),
+                'host': info.get('host'),
+            },
+            cause=str(e),
+            retriable=True,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        return 1
 
 
 def main():
     parser = argparse.ArgumentParser(description='SSH 长连接守护进程 v3.0')
+    add_reporting_arguments(parser)
     subparsers = parser.add_subparsers(dest='command', help='操作命令')
 
     # start
@@ -551,15 +704,15 @@ def main():
     args = parser.parse_args()
 
     if args.command == 'start':
-        cmd_start(args.alias, args.idle_timeout)
-    elif args.command == 'stop':
-        cmd_stop(args.alias)
-    elif args.command == 'status':
-        cmd_status(args.alias)
-    else:
-        parser.print_help()
-        sys.exit(1)
+        return cmd_start(args)
+    if args.command == 'stop':
+        return cmd_stop(args)
+    if args.command == 'status':
+        return cmd_status(args)
+
+    parser.print_help()
+    return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

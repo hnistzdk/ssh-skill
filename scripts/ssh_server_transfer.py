@@ -39,17 +39,54 @@ import re
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_script_dir, 'lib'))
 
+from path_normalization import normalize_remote_path, PathNormalizationError
+from reporting import add_reporting_arguments, emit_json, progress_enabled, verbose_details
 
-def _fix_remote_path(path):
-    """修复被 MSYS bash 转换的远程路径（Windows 环境）"""
-    if re.match(r'^[A-Za-z]:[/\\]', path):
-        print(json.dumps({
-            'success': False,
-            'error': f'远程路径被 Windows MSYS 转换: {path}. '
-                     f'请使用 MSYS_NO_PATHCONV=1 前缀或用引号包裹路径。'
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        sys.exit(1)
-    return path
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(operation, target, code, message, details=None, cause=None, retriable=False, mode=None):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
+
+
+def _is_typed_error(value):
+    return isinstance(value, dict) and {'code', 'message', 'details', 'cause', 'retriable'}.issubset(value.keys())
+
+
+def _build_result_payload(raw_result, extra_details=None):
+    if not isinstance(raw_result, dict):
+        payload = {'value': raw_result}
+    else:
+        payload = {}
+        for key, value in raw_result.items():
+            if key in ('success', 'mode', 'error'):
+                continue
+            payload[key] = value
+
+    if extra_details:
+        payload['reporting'] = extra_details
+    return payload
+
+
+def _report_progress(enabled, payload):
+    if enabled:
+        sys.stderr.write(json.dumps(payload, ensure_ascii=True) + '\n')
+        sys.stderr.flush()
 
 
 def _human_size(size_bytes):
@@ -61,6 +98,15 @@ def _human_size(size_bytes):
     elif size_bytes >= 1024:
         return f"{size_bytes / 1024:.2f} KB"
     return f"{size_bytes} B"
+
+
+def _stream_error_code(exception):
+    message = str(exception).lower()
+    if isinstance(exception, FileNotFoundError) or 'no such file' in message:
+        return 'target_resolution_error'
+    if 'permission denied' in message:
+        return 'auth_error'
+    return 'transport_error'
 
 
 def check_ssh_agent():
@@ -178,8 +224,8 @@ def stream_transfer(source_alias, source_path, dest_alias, dest_path,
     source_params = get_connection_params(source_alias)
     dest_params = get_connection_params(dest_alias)
 
-    source_client = create_ssh_client(source_params)
-    dest_client = create_ssh_client(dest_params)
+    source_client = create_ssh_client(source_alias)
+    dest_client = create_ssh_client(dest_alias)
 
     source_ssh = source_client._get_connection()
     dest_ssh = dest_client._get_connection()
@@ -233,7 +279,13 @@ def _stream_transfer_file(source_sftp, dest_sftp, source_path, dest_path,
         return {
             'success': False,
             'mode': 'stream',
-            'error': f'无法获取源文件信息: {e}'
+            'error': _build_error(
+                _stream_error_code(e),
+                f'无法获取源文件信息: {e}',
+                details={'source_path': source_path},
+                cause=str(e),
+                retriable=False,
+            )
         }
 
     # 如果目标路径以 / 结尾，追加源文件名
@@ -271,8 +323,7 @@ def _stream_transfer_file(source_sftp, dest_sftp, source_path, dest_path,
                             'total': total_size,
                             'speed': _human_size(int(speed)) + '/s',
                         }
-                        sys.stderr.write(json.dumps(info, ensure_ascii=True) + '\n')
-                        sys.stderr.flush()
+                        _report_progress(progress, info)
 
         elapsed = time.time() - start_time
         return {
@@ -289,7 +340,17 @@ def _stream_transfer_file(source_sftp, dest_sftp, source_path, dest_path,
             'success': False,
             'mode': 'stream',
             'bytes_transferred': transferred,
-            'error': f'流式传输失败: {e}'
+            'error': _build_error(
+                _stream_error_code(e),
+                f'流式传输失败: {e}',
+                details={
+                    'source_path': source_path,
+                    'dest_path': dest_path,
+                    'bytes_transferred': transferred,
+                },
+                cause=str(e),
+                retriable=False,
+            )
         }
 
 
@@ -313,7 +374,19 @@ def _stream_transfer_directory(source_sftp, dest_sftp, source_dir, dest_dir,
         try:
             entries = source_sftp.listdir_attr(src_dir)
         except Exception as e:
-            errors.append(f"无法列出目录 {src_dir}: {e}")
+            errors.append(_build_error(
+                _stream_error_code(e),
+                f'无法列出目录: {src_dir}',
+                details={
+                    'source_alias': source_alias,
+                    'dest_alias': dest_alias,
+                    'source_path': src_dir,
+                    'dest_path': dst_dir,
+                    'operation': 'listdir',
+                },
+                cause=str(e),
+                retriable=False,
+            ))
             files_failed += 1
             return
 
@@ -335,7 +408,22 @@ def _stream_transfer_directory(source_sftp, dest_sftp, source_dir, dest_dir,
                     total_bytes += result.get('bytes_transferred', 0)
                 else:
                     files_failed += 1
-                    errors.append(result.get('error', f'传输失败: {src_path}'))
+                    raw_error = result.get('error')
+                    if _is_typed_error(raw_error):
+                        errors.append(raw_error)
+                    else:
+                        errors.append(_build_error(
+                            'internal_error',
+                            f'传输失败: {src_path}',
+                            details={
+                                'source_alias': source_alias,
+                                'dest_alias': dest_alias,
+                                'source_path': src_path,
+                                'dest_path': dst_path,
+                            },
+                            cause=str(raw_error) if raw_error else None,
+                            retriable=False,
+                        ))
 
     transfer_dir_recursive(source_dir, dest_dir)
 
@@ -448,33 +536,112 @@ def direct_transfer(source_alias, source_path, dest_alias, dest_path,
             if stripped:
                 output_lines.append(stripped)
                 if progress:
-                    # 解析进度并输出
                     progress_info = _parse_transfer_progress(stripped, use_rsync)
                     if progress_info:
-                        sys.stderr.write(
-                            json.dumps(progress_info, ensure_ascii=True) + '\n'
-                        )
-                        sys.stderr.flush()
+                        _report_progress(progress, progress_info)
 
         exit_code = stdout.channel.recv_exit_status()
         stderr_text = stderr.read().decode('utf-8', errors='replace')
         elapsed = time.time() - start_time
 
+        if exit_code != 0:
+            message = stderr_text.strip() or 'Direct transfer failed'
+            lowered = message.lower()
+            if 'permission denied' in lowered or 'authentication failed' in lowered:
+                error_code = 'auth_error'
+            elif 'no such file' in lowered or 'not found' in lowered:
+                error_code = 'target_resolution_error'
+            else:
+                error_code = 'transport_error'
+            return {
+                'success': False,
+                'mode': 'direct',
+                'method': 'rsync' if use_rsync else 'scp',
+                'exit_code': exit_code,
+                'time_elapsed': round(elapsed, 2),
+                'command': cmd,
+                'output': '\n'.join(output_lines[-20:]),
+                'stderr': stderr_text,
+                'error': _build_error(
+                    error_code,
+                    message,
+                    details={
+                        'command': cmd,
+                        'source_alias': source_alias,
+                        'dest_alias': dest_alias,
+                        'source_path': source_path,
+                        'dest_path': dest_path,
+                        'method': 'rsync' if use_rsync else 'scp',
+                        'exit_code': exit_code,
+                    },
+                    cause=stderr_text.strip() or None,
+                    retriable=False,
+                ),
+            }
+
         return {
-            'success': exit_code == 0,
+            'success': True,
             'mode': 'direct',
             'method': 'rsync' if use_rsync else 'scp',
             'exit_code': exit_code,
             'time_elapsed': round(elapsed, 2),
             'command': cmd,
             'output': '\n'.join(output_lines[-20:]),  # 最后 20 行输出
-            'stderr': stderr_text if exit_code != 0 else None,
+            'stderr': None,
+        }
+    except paramiko.AuthenticationException as e:
+        return {
+            'success': False,
+            'mode': 'direct',
+            'command': cmd,
+            'error': _build_error(
+                'auth_error',
+                f'源服务器认证失败: {e}',
+                details={
+                    'source_alias': source_alias,
+                    'dest_alias': dest_alias,
+                    'source_path': source_path,
+                    'dest_path': dest_path,
+                    'command': cmd,
+                },
+                cause=str(e),
+                retriable=False,
+            ),
+        }
+    except FileNotFoundError as e:
+        return {
+            'success': False,
+            'mode': 'direct',
+            'command': cmd,
+            'error': _build_error(
+                'target_resolution_error',
+                f'未找到传输命令: {e}',
+                details={
+                    'command': cmd,
+                    'source_alias': source_alias,
+                    'dest_alias': dest_alias,
+                },
+                cause=str(e),
+                retriable=False,
+            ),
         }
     except Exception as e:
         return {
             'success': False,
             'mode': 'direct',
-            'error': f'直连传输失败: {e}',
+            'error': _build_error(
+                'transport_error',
+                f'直连传输失败: {e}',
+                details={
+                    'command': cmd,
+                    'source_alias': source_alias,
+                    'dest_alias': dest_alias,
+                    'source_path': source_path,
+                    'dest_path': dest_path,
+                },
+                cause=str(e),
+                retriable=False,
+            ),
             'command': cmd,
         }
     finally:
@@ -516,21 +683,59 @@ def validate_transfer(source_alias, dest_alias):
 
     # 检查源服务器连接
     try:
-        client = create_ssh_client(get_connection_params(source_alias))
+        client = create_ssh_client(source_alias)
         result = client.execute("echo OK")
         if not result.success:
-            issues.append(f"无法连接到源服务器 {source_alias}: {result.stderr}")
+            issues.append(_build_error(
+                'connection_error',
+                f'无法连接到源服务器: {source_alias}',
+                details={
+                    'target_role': 'source',
+                    'alias': source_alias,
+                    'stderr': result.stderr,
+                },
+                cause=result.stderr or 'echo OK failed',
+                retriable=False,
+            ))
     except Exception as e:
-        issues.append(f"源服务器 {source_alias} 连接失败: {e}")
+        issues.append(_build_error(
+            'connection_error',
+            f'源服务器连接失败: {source_alias}',
+            details={
+                'target_role': 'source',
+                'alias': source_alias,
+            },
+            cause=str(e),
+            retriable=False,
+        ))
 
     # 检查目标服务器连接
     try:
-        client = create_ssh_client(get_connection_params(dest_alias))
+        client = create_ssh_client(dest_alias)
         result = client.execute("echo OK")
         if not result.success:
-            issues.append(f"无法连接到目标服务器 {dest_alias}: {result.stderr}")
+            issues.append(_build_error(
+                'connection_error',
+                f'无法连接到目标服务器: {dest_alias}',
+                details={
+                    'target_role': 'destination',
+                    'alias': dest_alias,
+                    'stderr': result.stderr,
+                },
+                cause=result.stderr or 'echo OK failed',
+                retriable=False,
+            ))
     except Exception as e:
-        issues.append(f"目标服务器 {dest_alias} 连接失败: {e}")
+        issues.append(_build_error(
+            'connection_error',
+            f'目标服务器连接失败: {dest_alias}',
+            details={
+                'target_role': 'destination',
+                'alias': dest_alias,
+            },
+            cause=str(e),
+            retriable=False,
+        ))
 
     return issues
 
@@ -560,7 +765,13 @@ def server_transfer(source_alias, source_path, dest_alias, dest_path,
     if issues:
         return {
             'success': False,
-            'error': '前置条件检查失败',
+            'error': _build_error(
+                'connection_error',
+                '前置条件检查失败',
+                details={'issues': issues},
+                cause='; '.join(issue.get('message') or issue.get('cause') or 'validation failed' for issue in issues),
+                retriable=False,
+            ),
             'issues': issues,
         }
 
@@ -577,32 +788,26 @@ def server_transfer(source_alias, source_path, dest_alias, dest_path,
         selected_mode = mode
         mode_reason = f"强制使用模式: {selected_mode}"
 
-    if progress:
-        sys.stderr.write(json.dumps({
-            'status': 'mode_selected',
-            'mode': selected_mode,
-            'reason': mode_reason,
-        }, ensure_ascii=False) + '\n')
-        sys.stderr.flush()
+    _report_progress(progress, {
+        'status': 'mode_selected',
+        'mode': selected_mode,
+        'reason': mode_reason,
+    })
 
     # 2. 执行传输
     try:
         if selected_mode == 'direct':
             if not check_ssh_agent():
                 if mode == 'hybrid':
-                    # 混合模式：无 agent 时降级
-                    if progress:
-                        sys.stderr.write(json.dumps({
-                            'status': 'fallback',
-                            'reason': '未检测到 SSH agent，降级到流式转发'
-                        }, ensure_ascii=False) + '\n')
-                        sys.stderr.flush()
+                    _report_progress(progress, {
+                        'status': 'fallback',
+                        'reason': '未检测到 SSH agent，降级到流式转发'
+                    })
                     return stream_transfer(
                         source_alias, source_path,
                         dest_alias, dest_path, progress
                     )
                 elif mode == 'direct':
-                    # 强制直连但无 agent，仍然尝试（可能有预配置密钥）
                     pass
 
             return direct_transfer(
@@ -620,22 +825,31 @@ def server_transfer(source_alias, source_path, dest_alias, dest_path,
     except Exception as e:
         # 混合模式：直连失败后降级
         if mode == 'hybrid' and selected_mode == 'direct':
-            if progress:
-                sys.stderr.write(json.dumps({
-                    'status': 'fallback',
-                    'reason': f'直连模式失败: {e}，自动降级到流式转发'
-                }, ensure_ascii=False) + '\n')
-                sys.stderr.flush()
+            _report_progress(progress, {
+                'status': 'fallback',
+                'reason': f'直连模式失败: {e}，自动降级到流式转发'
+            })
             return stream_transfer(
                 source_alias, source_path,
                 dest_alias, dest_path, progress
             )
-        else:
-            return {
-                'success': False,
-                'mode': selected_mode,
-                'error': str(e),
-            }
+        return {
+            'success': False,
+            'mode': selected_mode,
+            'error': _build_error(
+                'internal_error',
+                str(e),
+                details={
+                    'source_alias': source_alias,
+                    'dest_alias': dest_alias,
+                    'source_path': source_path,
+                    'dest_path': dest_path,
+                    'mode': selected_mode,
+                },
+                cause=str(e),
+                retriable=False,
+            ),
+        }
 
 
 def main():
@@ -659,14 +873,39 @@ def main():
                         help='大小阈值（MB），超过此值优先使用直连 (默认: 10)')
     parser.add_argument('--timeout', type=int, default=300,
                         help='超时时间（秒）(默认: 300)')
+    add_reporting_arguments(parser)
 
     args = parser.parse_args()
+    target = f"{args.source_alias}->{args.dest_alias}"
 
-    # 修复 MSYS 路径转换
-    source_path = _fix_remote_path(args.source_path)
-    dest_path = _fix_remote_path(args.dest_path)
+    try:
+        source_path = normalize_remote_path(args.source_path, role='source_path')
+        dest_path = normalize_remote_path(args.dest_path, role='dest_path')
+    except PathNormalizationError as e:
+        emit_json(_build_failure(
+            operation='server_transfer',
+            target=target,
+            code=e.code,
+            message=str(e),
+            details=e.to_error().get('details'),
+            retriable=False,
+            mode=args.mode,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
+        sys.exit(1)
 
-    show_progress = not args.no_progress
+    show_progress = progress_enabled(args, default=args.progress)
+    reporting = verbose_details(
+        args,
+        source_alias=args.source_alias,
+        dest_alias=args.dest_alias,
+        source_path=source_path,
+        dest_path=dest_path,
+        requested_mode=args.mode,
+        use_rsync=args.use_rsync,
+        size_threshold_mb=args.size_threshold,
+        timeout_seconds=args.timeout,
+        progress_enabled=show_progress,
+    )
 
     try:
         result = server_transfer(
@@ -681,27 +920,74 @@ def main():
             timeout=args.timeout,
         )
 
-        # 输出结果
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        sys.exit(0 if result.get('success') else 1)
+        success = bool(result.get('success'))
+        mode = result.get('mode') or args.mode
+        raw_error = result.get('error')
+        normalized_error = None
+        if not success:
+            if _is_typed_error(raw_error):
+                normalized_error = raw_error
+            else:
+                normalized_error = _build_error(
+                    'transport_error',
+                    str(raw_error or 'Server transfer failed'),
+                    details={
+                        'source_alias': args.source_alias,
+                        'dest_alias': args.dest_alias,
+                        'source_path': source_path,
+                        'dest_path': dest_path,
+                        'mode': mode,
+                    },
+                    cause=str(raw_error) if raw_error else None,
+                    retriable=False,
+                )
+
+        emit_json({
+            'schema_version': '1.0',
+            'success': success,
+            'operation': 'server_transfer',
+            'target': target,
+            'mode': mode,
+            'result': _build_result_payload(result, extra_details=reporting),
+            'error': normalized_error,
+        }, args=args, ensure_ascii=False)
+        sys.exit(0 if success else 1)
 
     except FileNotFoundError as e:
-        print(json.dumps({
-            'success': False,
-            'error': f'配置文件未找到: {e}'
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
+        emit_json(_build_failure(
+            operation='server_transfer',
+            target=target,
+            code='target_resolution_error',
+            message=f'配置文件未找到: {e}',
+            details={'source_alias': args.source_alias, 'dest_alias': args.dest_alias},
+            cause=str(e),
+            retriable=False,
+            mode=args.mode,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
         sys.exit(1)
     except ValueError as e:
-        print(json.dumps({
-            'success': False,
-            'error': f'无效的别名: {e}'
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
+        emit_json(_build_failure(
+            operation='server_transfer',
+            target=target,
+            code='cli_argument_error',
+            message=f'无效的别名: {e}',
+            details={'source_alias': args.source_alias, 'dest_alias': args.dest_alias},
+            cause=str(e),
+            retriable=False,
+            mode=args.mode,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
         sys.exit(1)
     except Exception as e:
-        print(json.dumps({
-            'success': False,
-            'error': f'传输错误: {e}'
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
+        emit_json(_build_failure(
+            operation='server_transfer',
+            target=target,
+            code='internal_error',
+            message=f'传输错误: {e}',
+            details={'source_alias': args.source_alias, 'dest_alias': args.dest_alias},
+            cause=str(e),
+            retriable=False,
+            mode=args.mode,
+        ), args=args, stream=sys.stderr, ensure_ascii=False)
         sys.exit(1)
 
 

@@ -4,19 +4,62 @@
 迁移服务器从密码认证到密钥认证
 
 更新 SSH config：
-1. 移除 password 字段
+1. 移除 password 注释字段
 2. 添加 IdentityFile 配置
-3. 将密码保存到 tags 中（格式：pwd:原密码）
+3. 不再持久化密码信息
 """
 
 import sys
 import os
 import re
+import argparse
 
 # 修复 Windows 终端 UTF-8 输出
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_script_dir, 'lib'))
+
+from reporting import add_reporting_arguments, emit_json, verbose_details
+
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(operation, target, code, message, details=None, cause=None, retriable=False, mode='local'):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
+
+
+def _build_success(operation, target, result, mode='local', args=None, **details):
+    payload = dict(result)
+    reporting = verbose_details(args, **details)
+    if reporting:
+        payload['reporting'] = reporting
+    return {
+        'schema_version': '1.0',
+        'success': True,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'result': payload,
+        'error': None,
+    }
 
 
 def migrate_to_key_auth(alias, key_file):
@@ -28,18 +71,21 @@ def migrate_to_key_auth(alias, key_file):
         key_file: 密钥文件名（如 id_rsa_sa_legacy）
 
     Returns:
-        bool: 是否成功
+        dict: 执行结果
     """
     config_path = os.path.expanduser("~/.ssh/config")
 
     if not os.path.exists(config_path):
-        print(f"错误: SSH config 文件不存在: {config_path}")
-        return False
+        return {
+            'success': False,
+            'code': 'target_resolution_error',
+            'message': f'SSH config 文件不存在: {config_path}',
+            'details': {'config_path': config_path},
+        }
 
     with open(config_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
-    # 查找该 Host 的位置
     host_index = -1
     for i, line in enumerate(lines):
         if line.strip().startswith('Host ') and not line.strip().startswith('Host *'):
@@ -49,10 +95,13 @@ def migrate_to_key_auth(alias, key_file):
                 break
 
     if host_index == -1:
-        print(f"错误: 找不到服务器 {alias}")
-        return False
+        return {
+            'success': False,
+            'code': 'target_resolution_error',
+            'message': f'找不到服务器 {alias}',
+            'details': {'alias': alias, 'config_path': config_path},
+        }
 
-    # 向前查找注释块
     comment_start = host_index
     for i in range(host_index - 1, max(0, host_index - 20), -1):
         line = lines[i].strip()
@@ -62,42 +111,26 @@ def migrate_to_key_auth(alias, key_file):
         if not line.startswith('#') and line:
             break
 
-    # 查找 password 和 tags 字段
     password_index = -1
-    password_value = None
-    tags_index = -1
-    tags_value = []
+    had_password_annotation = False
 
     for i in range(comment_start, host_index):
         line = lines[i].strip()
         if line.startswith('# password:'):
             password_index = i
-            password_value = line[11:].strip()
-        elif line.startswith('# tags:'):
-            tags_index = i
-            tags_value = [t.strip() for t in line[7:].strip().split(',') if t.strip()]
+            had_password_annotation = True
+            break
 
-    if not password_value:
-        print(f"警告: {alias} 没有配置密码，可能已经是密钥认证")
-        return False
+    if password_index == -1:
+        return {
+            'success': False,
+            'code': 'auth_error',
+            'message': f'{alias} 没有配置密码注释，可能已经是密钥认证',
+            'details': {'alias': alias, 'config_path': config_path},
+        }
 
-    # 更新 tags：添加 pwd:密码
-    if password_value:
-        tags_value.append(f"pwd:{password_value}")
+    lines[password_index] = ''
 
-    # 移除 password 行
-    if password_index != -1:
-        lines[password_index] = ''
-
-    # 更新 tags 行
-    if tags_index != -1:
-        lines[tags_index] = f"# tags: {','.join(tags_value)}\n"
-    else:
-        # 在 Host 行前添加 tags
-        lines.insert(host_index, f"# tags: {','.join(tags_value)}\n")
-        host_index += 1
-
-    # 查找 Host 块的结束位置
     host_end = host_index + 1
     for i in range(host_index + 1, len(lines)):
         line = lines[i].strip()
@@ -107,48 +140,68 @@ def migrate_to_key_auth(alias, key_file):
             break
         host_end = i + 1
 
-    # 检查是否已有 IdentityFile
     has_identity_file = False
     for i in range(host_index, host_end):
         if 'IdentityFile' in lines[i]:
             has_identity_file = True
             break
 
-    # 添加 IdentityFile（如果不存在）
     if not has_identity_file:
-        # 在 Host 块的最后添加
         indent = '    '
         lines.insert(host_end, f"{indent}IdentityFile ~/.ssh/{key_file}\n")
 
-    # 写回文件
     with open(config_path, 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
-    print(f"✓ 已将 {alias} 迁移到密钥认证")
-    print(f"  - 密钥文件: ~/.ssh/{key_file}")
-    print(f"  - 原密码已保存到 tags 中")
-
-    return True
+    return {
+        'success': True,
+        'message': f'现在可以使用密钥连接到 {alias}',
+        'alias': alias,
+        'key_file': key_file,
+        'config_path': config_path,
+        'password_annotation_removed': had_password_annotation,
+        'identity_file_added': not has_identity_file,
+    }
 
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser(description='迁移服务器从密码认证到密钥认证')
+    add_reporting_arguments(parser)
     parser.add_argument('alias', help='服务器别名')
     parser.add_argument('--key-file', required=True, help='密钥文件名（如 id_rsa_sa_legacy）')
 
     args = parser.parse_args()
+    operation = 'migrate_to_key_auth'
 
-    success = migrate_to_key_auth(args.alias, args.key_file)
+    result = migrate_to_key_auth(args.alias, args.key_file)
 
-    if success:
-        print(f"\n成功！现在可以使用密钥连接到 {args.alias}")
-        sys.exit(0)
-    else:
-        print(f"\n失败: 无法迁移 {args.alias}")
-        sys.exit(1)
+    if result.get('success'):
+        emit_json(_build_success(
+            operation=operation,
+            target=args.alias,
+            args=args,
+            result=result,
+            alias=args.alias,
+            key_file=args.key_file,
+            config_path=result.get('config_path'),
+        ), args=args, ensure_ascii=False)
+        return 0
+
+    emit_json(_build_failure(
+        operation=operation,
+        target=args.alias,
+        code=result.get('code', 'internal_error'),
+        message=result.get('message', f'无法迁移 {args.alias}'),
+        details={
+            'alias': args.alias,
+            'key_file': args.key_file,
+            **result.get('details', {}),
+        },
+        cause=result.get('cause'),
+        retriable=False,
+    ), args=args, stream=sys.stderr, ensure_ascii=False)
+    return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

@@ -5,14 +5,57 @@
 
 1. 从原始 JSON 配置中提取元数据填充注释
 2. 统一证书文件路径格式为 ~/.ssh/keyfile
-3. 在注释中添加密码字段（如果有）
+3. 不再在注释中写入密码字段
 """
 
+import sys
 import os
 import json
 import re
+import argparse
 from datetime import datetime
-from pathlib import Path
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_script_dir, 'lib'))
+
+from reporting import add_reporting_arguments, emit_json, verbose_details
+
+
+def _build_error(code, message, details=None, cause=None, retriable=False):
+    return {
+        'code': code,
+        'message': message,
+        'details': details or {},
+        'cause': cause,
+        'retriable': retriable,
+    }
+
+
+def _build_failure(operation, target, code, message, details=None, cause=None, retriable=False, mode='local'):
+    return {
+        'schema_version': '1.0',
+        'success': False,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'error': _build_error(code, message, details=details, cause=cause, retriable=retriable),
+    }
+
+
+def _build_success(operation, target, result, mode='local', args=None, **details):
+    payload = dict(result)
+    reporting = verbose_details(args, **details)
+    if reporting:
+        payload['reporting'] = reporting
+    return {
+        'schema_version': '1.0',
+        'success': True,
+        'operation': operation,
+        'target': target,
+        'mode': mode,
+        'result': payload,
+        'error': None,
+    }
 
 
 def load_json_config(json_path):
@@ -20,19 +63,16 @@ def load_json_config(json_path):
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except Exception as e:
-        print(f"  警告: 无法加载 {json_path}: {e}")
+    except Exception:
         return None
 
 
 def find_json_config_by_alias(alias, json_dir):
     """根据别名查找对应的 JSON 配置文件"""
-    # 尝试直接匹配
     json_path = os.path.join(json_dir, f"{alias}.json")
     if os.path.exists(json_path):
         return load_json_config(json_path)
 
-    # 尝试大小写不敏感匹配
     for filename in os.listdir(json_dir):
         if not filename.endswith('.json'):
             continue
@@ -42,7 +82,6 @@ def find_json_config_by_alias(alias, json_dir):
             json_path = os.path.join(json_dir, filename)
             return load_json_config(json_path)
 
-    # 尝试从 JSON 中的 name 字段匹配
     for filename in os.listdir(json_dir):
         if not filename.endswith('.json'):
             continue
@@ -68,25 +107,16 @@ def normalize_key_path(key_path):
     if not key_path:
         return key_path
 
-    # 已经是 ~/.ssh/ 格式，直接返回
     if key_path.startswith('~/.ssh/'):
         return key_path
 
-    # Windows 绝对路径转换为 ~/.ssh/ 格式
-    # C:\Users\zhangyang\.ssh\keyfile -> ~/.ssh/keyfile
-    # C:\Users\zhangyang/.ssh\keyfile -> ~/.ssh/keyfile
-    # C:/Users/zhangyang/.ssh/keyfile -> ~/.ssh/keyfile
-
-    # 统一路径分隔符
     normalized = key_path.replace('\\', '/')
 
-    # 提取 .ssh 之后的部分
     if '/.ssh/' in normalized:
         parts = normalized.split('/.ssh/')
         if len(parts) == 2:
             return f"~/.ssh/{parts[1]}"
 
-    # 如果无法转换，返回原路径
     return key_path
 
 
@@ -97,25 +127,21 @@ def extract_metadata_from_json(config):
         'environment': 'unknown',
         'tags': [],
         'location': '',
-        'password': ''
+        'has_password': False,
     }
 
-    # 描述
     if 'description' in config:
         metadata['description'] = config['description']
     elif 'notes' in config:
         metadata['description'] = config['notes']
 
-    # 从 metadata 字段提取
     if 'metadata' in config:
         meta = config['metadata']
         metadata['environment'] = meta.get('environment', 'unknown')
         metadata['tags'] = meta.get('tags', [])
         metadata['location'] = meta.get('location', '')
 
-    # 密码
-    if 'password' in config and config['password']:
-        metadata['password'] = config['password']
+    metadata['has_password'] = bool(config.get('password'))
 
     return metadata
 
@@ -148,9 +174,7 @@ def parse_ssh_config(config_path):
         line = lines[i]
         stripped = line.strip()
 
-        # 检查是否是 Host 行
         if stripped.startswith('Host ') and not stripped.startswith('Host *'):
-            # 保存上一个 Host 块
             if current_host_line:
                 alias = extract_alias_from_host_line(current_host_line)
                 blocks.append({
@@ -160,19 +184,15 @@ def parse_ssh_config(config_path):
                     'alias': alias
                 })
 
-            # 开始新的 Host 块
             current_host_line = line
             current_config = []
             in_host_block = True
 
         elif in_host_block:
-            # 在 Host 块中
             if stripped and not stripped.startswith('#'):
-                # 配置行（缩进的）
                 if line.startswith((' ', '\t')):
                     current_config.append(line)
                 else:
-                    # 遇到非缩进的非注释行，Host 块结束
                     in_host_block = False
                     current_comments = []
                     if stripped.startswith('#'):
@@ -184,7 +204,6 @@ def parse_ssh_config(config_path):
                 in_host_block = False
                 current_comments = []
         else:
-            # 不在 Host 块中
             if stripped.startswith('#') or not stripped:
                 current_comments.append(line)
             else:
@@ -192,7 +211,6 @@ def parse_ssh_config(config_path):
 
         i += 1
 
-    # 保存最后一个 Host 块
     if current_host_line:
         alias = extract_alias_from_host_line(current_host_line)
         blocks.append({
@@ -223,23 +241,14 @@ def generate_updated_comments(alias, metadata):
         f"# environment: {metadata.get('environment', 'unknown')}\n",
     ]
 
-    # 标签
     tags = metadata.get('tags', [])
     if tags:
         comments.append(f"# tags: {','.join(tags)}\n")
     else:
-        comments.append(f"# tags: \n")
+        comments.append("# tags: \n")
 
-    # 位置
     location = metadata.get('location', '')
     comments.append(f"# location: {location}\n")
-
-    # 密码（如果有）
-    password = metadata.get('password', '')
-    if password:
-        comments.append(f"# password: {password}\n")
-
-    # 时间
     comments.append(f"# created_at: {now}\n")
     comments.append(f"# updated_at: {now}\n")
 
@@ -251,7 +260,6 @@ def normalize_config_lines(config_lines):
     normalized = []
 
     for line in config_lines:
-        # 检查是否是 IdentityFile 行
         if 'IdentityFile' in line:
             match = re.match(r'(\s*)IdentityFile\s+(.+)', line)
             if match:
@@ -278,75 +286,134 @@ def fix_ssh_config(config_path, json_dir, output_path=None):
     if output_path is None:
         output_path = config_path
 
-    # 解析现有配置
+    if not os.path.exists(config_path):
+        return {
+            'success': False,
+            'code': 'target_resolution_error',
+            'message': f'SSH config 文件不存在: {config_path}',
+            'details': {
+                'config_path': config_path,
+                'json_dir': json_dir,
+                'output_path': output_path,
+            },
+        }
+
+    if not os.path.exists(json_dir):
+        return {
+            'success': False,
+            'code': 'target_resolution_error',
+            'message': f'JSON 配置目录不存在: {json_dir}',
+            'details': {
+                'config_path': config_path,
+                'json_dir': json_dir,
+                'output_path': output_path,
+            },
+        }
+
     blocks = parse_ssh_config(config_path)
 
-    print(f"找到 {len(blocks)} 个 Host 配置")
-
-    # 处理每个块
     new_lines = []
     updated_count = 0
     normalized_count = 0
-    password_count = 0
+    password_fields_ignored = 0
+    updated_aliases = []
+    skipped_aliases = []
 
     for block in blocks:
         alias = block['alias']
 
         if not alias:
-            # 无法提取别名，保持原样
             new_lines.extend(block['comments'])
             new_lines.append(block['host_line'])
             new_lines.extend(block['config_lines'])
             continue
 
-        # 查找对应的 JSON 配置
         json_config = find_json_config_by_alias(alias, json_dir)
 
         if json_config:
-            # 提取元数据
             metadata = extract_metadata_from_json(json_config)
-
-            # 生成新注释
             new_comments = generate_updated_comments(alias, metadata)
             new_lines.extend(new_comments)
 
             updated_count += 1
+            updated_aliases.append(alias)
 
-            if metadata.get('password'):
-                password_count += 1
-                print(f"  更新 {alias}（包含密码）")
-            else:
-                print(f"  更新 {alias}")
+            if metadata.get('has_password'):
+                password_fields_ignored += 1
         else:
-            # 没有找到 JSON 配置，保持原注释
             new_lines.extend(block['comments'])
-            print(f"  跳过 {alias}（未找到 JSON 配置）")
+            skipped_aliases.append(alias)
 
-        # Host 行
         new_lines.append(block['host_line'])
 
-        # 标准化配置行中的证书路径
         normalized_config = normalize_config_lines(block['config_lines'])
-
-        # 检查是否有路径被标准化
         if normalized_config != block['config_lines']:
             normalized_count += 1
 
         new_lines.extend(normalized_config)
 
-    # 写入新配置
     with open(output_path, 'w', encoding='utf-8') as f:
         f.writelines(new_lines)
 
-    print(f"\n完成:")
-    print(f"  更新元数据: {updated_count} 个")
-    print(f"  标准化路径: {normalized_count} 个")
-    print(f"  添加密码: {password_count} 个")
-    print(f"  输出: {output_path}")
+    return {
+        'success': True,
+        'message': 'SSH config 修复完成',
+        'config_path': config_path,
+        'json_dir': json_dir,
+        'output_path': output_path,
+        'total_hosts': len(blocks),
+        'updated_metadata': updated_count,
+        'normalized_paths': normalized_count,
+        'password_fields_ignored': password_fields_ignored,
+        'updated_aliases': updated_aliases,
+        'skipped_aliases': skipped_aliases,
+        'overwrote_source': output_path == config_path,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description='修复 SSH Config 文件')
+    add_reporting_arguments(parser)
+    parser.add_argument('--config', default='~/.ssh/config', help='SSH config 文件路径（默认: ~/.ssh/config）')
+    parser.add_argument('--json-dir', default='~/.ssh/server_config', help='JSON 配置目录（默认: ~/.ssh/server_config）')
+    parser.add_argument('--output', help='输出文件路径（默认覆盖原文件）')
+
+    args = parser.parse_args()
+    operation = 'fix_ssh_config'
+
+    config_path = os.path.expanduser(args.config)
+    json_dir = os.path.expanduser(args.json_dir)
+    output_path = os.path.expanduser(args.output) if args.output else None
+
+    result = fix_ssh_config(config_path, json_dir, output_path)
+
+    if result.get('success'):
+        emit_json(_build_success(
+            operation=operation,
+            target=config_path,
+            args=args,
+            result=result,
+            config_path=config_path,
+            json_dir=json_dir,
+            output_path=result.get('output_path'),
+        ), args=args, ensure_ascii=False)
+        return 0
+
+    emit_json(_build_failure(
+        operation=operation,
+        target=config_path,
+        code=result.get('code', 'internal_error'),
+        message=result.get('message', '修复 SSH config 失败'),
+        details=result.get('details', {
+            'config_path': config_path,
+            'json_dir': json_dir,
+            'output_path': output_path or config_path,
+        }),
+        cause=result.get('cause'),
+        retriable=False,
+    ), args=args, stream=sys.stderr, ensure_ascii=False)
+    return 1
 
 
 if __name__ == '__main__':
-    config_path = os.path.expanduser('~/.ssh/config')
-    json_dir = os.path.expanduser('~/.ssh/server_config')
-
-    fix_ssh_config(config_path, json_dir)
+    sys.exit(main())
