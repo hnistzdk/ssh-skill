@@ -158,9 +158,26 @@ pip install paramiko
 
 ### 执行远程命令
 
+短命令使用 inline 模式：
+
 ```bash
 python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py prod-web-01 "systemctl status nginx"
 ```
+
+复杂引号、正则、变量、heredoc 或多行脚本使用脚本模式，避免本地 shell 提前展开：
+
+```bash
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py prod-web-01 --stdin-script < script.sh
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py prod-web-01 --script-file script.sh
+```
+
+认证失败或需要更新密码时使用 `--password`，命令执行成功后会保存到该别名的 SSH config 元数据；命令失败不会保存，避免持久化错误密码：
+
+```bash
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py prod-web-01 "true" --password '<密码>'
+```
+
+命令结果统一包含 `stdout_truncated`、`stderr_truncated`、`stdout_bytes`、`stderr_bytes`、`output_limit_bytes` 字段；大输出被截断是预期行为。
 
 ### 上传文件
 

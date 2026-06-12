@@ -9,9 +9,42 @@ import paramiko
 import threading
 import time
 import os
+import shlex
+import socket
 from typing import Optional, List, Union, Dict, Iterator
 from dataclasses import dataclass
 from io import StringIO
+
+from output_utils import read_bounded_channel
+
+
+def _open_proxy_socket(proxy_command: Optional[str], host: str, port: int, timeout: int):
+    if not proxy_command:
+        return None
+
+    parts = shlex.split(proxy_command.replace('%h', host).replace('%p', str(port)))
+    if len(parts) >= 5 and parts[0] == 'connect' and parts[1] == '-H':
+        proxy_host, proxy_port = parts[2].rsplit(':', 1)
+        sock = socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout)
+        sock.settimeout(timeout)
+        request = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode('ascii')
+        sock.sendall(request)
+        response = b''
+        while b'\r\n\r\n' not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+            if len(response) > 65536:
+                break
+        status_line = response.split(b'\r\n', 1)[0]
+        if b' 200 ' not in status_line:
+            sock.close()
+            raise OSError(f"HTTP proxy CONNECT failed: {status_line.decode('latin1', errors='replace')}")
+        return sock
+
+    expanded_proxy_command = proxy_command.replace('%h', shlex.quote(host)).replace('%p', str(port))
+    return paramiko.ProxyCommand(expanded_proxy_command)
 
 
 def _format_transfer_errors(errors) -> str:
@@ -40,6 +73,13 @@ class SSHResult:
     stdout: str
     stderr: str
     exit_code: int
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    output_limit_bytes: int = 0
+    error_type: str = ''
+    error_message: str = ''
 
 
 class ConnectionPool:
@@ -59,9 +99,10 @@ class ConnectionPool:
         self._lock = threading.Lock()
         self._max_idle_time = max_idle_time
 
-    def _get_key(self, host: str, port: int, user: str) -> str:
+    def _get_key(self, host: str, port: int, user: str, proxy_command: Optional[str] = None) -> str:
         """生成连接唯一标识"""
-        return f"{user}@{host}:{port}"
+        proxy_suffix = f" via {proxy_command}" if proxy_command else ""
+        return f"{user}@{host}:{port}{proxy_suffix}"
 
     def get_connection(
         self,
@@ -71,7 +112,8 @@ class ConnectionPool:
         password: Optional[str] = None,
         key_file: Optional[str] = None,
         key_passphrase: Optional[str] = None,
-        timeout: int = 30
+        timeout: int = 30,
+        proxy_command: Optional[str] = None
     ) -> paramiko.SSHClient:
         """
         获取连接（从池中复用或创建新连接）
@@ -88,7 +130,7 @@ class ConnectionPool:
         Returns:
             paramiko.SSHClient 对象
         """
-        key = self._get_key(host, port, user)
+        key = self._get_key(host, port, user, proxy_command)
 
         with self._lock:
             # 清理过期连接
@@ -114,6 +156,8 @@ class ConnectionPool:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
             try:
+                sock = _open_proxy_socket(proxy_command, host, port, timeout)
+
                 if password:
                     # 密码认证
                     client.connect(
@@ -123,7 +167,8 @@ class ConnectionPool:
                         password=password,
                         timeout=timeout,
                         look_for_keys=False,
-                        allow_agent=False
+                        allow_agent=False,
+                        sock=sock
                     )
                 elif key_file:
                     # 密钥认证 - 优先尝试 ssh-agent
@@ -134,7 +179,8 @@ class ConnectionPool:
                         key_filename=key_file,
                         timeout=timeout,
                         look_for_keys=True,  # 允许查找密钥
-                        allow_agent=True     # 允许使用 ssh-agent
+                        allow_agent=True,     # 允许使用 ssh-agent
+                        sock=sock
                     )
                 else:
                     # 无密码无密钥 - 尝试 ssh-agent
@@ -144,7 +190,8 @@ class ConnectionPool:
                         username=user,
                         timeout=timeout,
                         look_for_keys=True,
-                        allow_agent=True
+                        allow_agent=True,
+                        sock=sock
                     )
 
                 # 加入连接池
@@ -220,7 +267,8 @@ class ParamikoClient:
         key_passphrase: Optional[str] = None,
         jump_hosts: Optional[List[Union[str, Dict]]] = None,
         forward_agent: bool = False,
-        transfer_timeout: Optional[int] = None
+        transfer_timeout: Optional[int] = None,
+        proxy_command: Optional[str] = None
     ):
         """
         初始化 Paramiko SSH 客户端
@@ -247,6 +295,7 @@ class ParamikoClient:
         self.jump_hosts = jump_hosts or []
         self.forward_agent = forward_agent
         self.transfer_timeout = transfer_timeout  # 文件传输超时（None表示无限制）
+        self.proxy_command = proxy_command
         self._jump_clients = []  # 保存跳板机连接链
         self._password_script = None
         self._password_script_password = None
@@ -609,7 +658,8 @@ class ParamikoClient:
             password=self.password,
             key_file=self.key_file,
             key_passphrase=self.key_passphrase,
-            timeout=self.timeout
+            timeout=self.timeout,
+            proxy_command=self.proxy_command
         )
 
     def execute(self, command: str) -> SSHResult:
@@ -625,23 +675,27 @@ class ParamikoClient:
         try:
             client = self._get_connection()
             stdin, stdout, stderr = client.exec_command(command, timeout=self.timeout)
-
-            stdout_text = stdout.read().decode('utf-8', errors='replace')
-            stderr_text = stderr.read().decode('utf-8', errors='replace')
-            exit_code = stdout.channel.recv_exit_status()
+            output = read_bounded_channel(stdout.channel)
 
             return SSHResult(
-                success=(exit_code == 0),
-                stdout=stdout_text,
-                stderr=stderr_text,
-                exit_code=exit_code
+                success=(output['exit_code'] == 0),
+                stdout=output['stdout'],
+                stderr=output['stderr'],
+                exit_code=output['exit_code'],
+                stdout_truncated=output['stdout_truncated'],
+                stderr_truncated=output['stderr_truncated'],
+                stdout_bytes=output['stdout_bytes'],
+                stderr_bytes=output['stderr_bytes'],
+                output_limit_bytes=output['output_limit_bytes'],
             )
         except Exception as e:
             return SSHResult(
                 success=False,
                 stdout="",
                 stderr=f"Execution error: {str(e)}",
-                exit_code=-1
+                exit_code=-1,
+                error_type='transport_error',
+                error_message=str(e),
             )
 
     def execute_with_agent_forward(self, command: str, timeout: Optional[int] = None) -> SSHResult:
@@ -693,9 +747,7 @@ class ParamikoClient:
                 command, timeout=cmd_timeout, get_pty=True
             )
 
-            stdout_text = stdout.read().decode('utf-8', errors='replace')
-            stderr_text = stderr.read().decode('utf-8', errors='replace')
-            exit_code = stdout.channel.recv_exit_status()
+            output = read_bounded_channel(stdout.channel)
 
             try:
                 session.close()
@@ -707,17 +759,24 @@ class ParamikoClient:
                 pass
 
             return SSHResult(
-                success=(exit_code == 0),
-                stdout=stdout_text,
-                stderr=stderr_text,
-                exit_code=exit_code
+                success=(output['exit_code'] == 0),
+                stdout=output['stdout'],
+                stderr=output['stderr'],
+                exit_code=output['exit_code'],
+                stdout_truncated=output['stdout_truncated'],
+                stderr_truncated=output['stderr_truncated'],
+                stdout_bytes=output['stdout_bytes'],
+                stderr_bytes=output['stderr_bytes'],
+                output_limit_bytes=output['output_limit_bytes'],
             )
         except Exception as e:
             return SSHResult(
                 success=False,
                 stdout="",
                 stderr=f"Agent forward execution error: {str(e)}",
-                exit_code=-1
+                exit_code=-1,
+                error_type='transport_error',
+                error_message=str(e),
             )
 
     def upload(self, local_path: str, remote_path: str, timeout: Optional[int] = None, show_progress: bool = True) -> SSHResult:

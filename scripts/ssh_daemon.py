@@ -37,6 +37,9 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_script_dir, 'lib'))
 
 from reporting import add_reporting_arguments, emit_json, verbose_details
+from exec_spec import build_inline_exec_spec, render_exec_spec
+from output_utils import read_bounded_channel
+from paramiko_client import _open_proxy_socket
 
 
 def _build_error(code, message, details=None, cause=None, retriable=False):
@@ -295,6 +298,7 @@ class SSHDaemon:
         port = params['port']
         password = params.get('password')
         key_file = params.get('key_file')
+        proxy_command = params.get('proxy_command')
 
         # 解析密钥路径
         if key_file:
@@ -304,11 +308,14 @@ class SSHDaemon:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
+        timeout = params.get('timeout', 30)
+        sock = _open_proxy_socket(proxy_command, host, port, timeout)
         connect_kwargs = {
             'hostname': host,
             'port': port,
             'username': user,
-            'timeout': params.get('timeout', 30),
+            'timeout': timeout,
+            'sock': sock,
         }
 
         if password:
@@ -385,8 +392,25 @@ class SSHDaemon:
 
             elif action == 'execute':
                 self._last_activity = time.time()
-                command = request.get('command', '')
+                exec_spec = request.get('exec')
+                if exec_spec is None:
+                    exec_spec = build_inline_exec_spec(request.get('command', ''))
                 timeout = request.get('timeout', 30)
+                try:
+                    command = render_exec_spec(exec_spec)
+                except Exception as e:
+                    _send_message(client_sock, {
+                        'success': False,
+                        'exit_code': -1,
+                        'stdout': '',
+                        'stderr': str(e),
+                        'error_type': 'protocol_error',
+                        'error_message': str(e),
+                        'mode': 'daemon',
+                        'method': 'daemon',
+                        'connector': 'daemon',
+                    })
+                    return
                 result = self._execute_command(command, timeout)
                 _send_message(client_sock, result)
 
@@ -435,22 +459,33 @@ class SSHDaemon:
                 stdin, stdout, stderr = self._ssh_client.exec_command(
                     command, timeout=timeout
                 )
-                stdout_text = stdout.read().decode('utf-8', errors='replace')
-                stderr_text = stderr.read().decode('utf-8', errors='replace')
-                exit_code = stdout.channel.recv_exit_status()
+                output = read_bounded_channel(stdout.channel)
 
                 return {
-                    'success': exit_code == 0,
-                    'exit_code': exit_code,
-                    'stdout': stdout_text,
-                    'stderr': stderr_text
+                    'success': output['exit_code'] == 0,
+                    'exit_code': output['exit_code'],
+                    'stdout': output['stdout'],
+                    'stderr': output['stderr'],
+                    'stdout_truncated': output['stdout_truncated'],
+                    'stderr_truncated': output['stderr_truncated'],
+                    'stdout_bytes': output['stdout_bytes'],
+                    'stderr_bytes': output['stderr_bytes'],
+                    'output_limit_bytes': output['output_limit_bytes'],
+                    'mode': 'daemon',
+                    'method': 'daemon',
+                    'connector': 'daemon',
                 }
             except Exception as e:
                 return {
                     'success': False,
                     'exit_code': -1,
                     'stdout': '',
-                    'stderr': f'命令执行错误: {str(e)}'
+                    'stderr': f'命令执行错误: {str(e)}',
+                    'error_type': 'transport_error',
+                    'error_message': str(e),
+                    'mode': 'daemon',
+                    'method': 'daemon',
+                    'connector': 'daemon',
                 }
 
     def _heartbeat_loop(self):

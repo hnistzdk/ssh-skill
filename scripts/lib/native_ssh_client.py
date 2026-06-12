@@ -16,6 +16,8 @@ import tempfile
 from typing import Optional, Iterator
 from dataclasses import dataclass
 
+from output_utils import run_bounded_process
+
 
 @dataclass
 class SSHResult:
@@ -24,6 +26,13 @@ class SSHResult:
     stdout: str
     stderr: str
     exit_code: int
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    output_limit_bytes: int = 0
+    error_type: str = ''
+    error_message: str = ''
 
 
 class NativeSSHClient:
@@ -126,28 +135,29 @@ class NativeSSHClient:
             args.append(f"{self.user}@{self.host}")
             args.append(command)
 
-            result = subprocess.run(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=self.timeout
-            )
+            output = run_bounded_process(args, timeout=self.timeout)
 
             return SSHResult(
-                success=(result.returncode == 0),
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.returncode
+                success=(output['exit_code'] == 0),
+                stdout=output['stdout'],
+                stderr=output['stderr'],
+                exit_code=output['exit_code'],
+                stdout_truncated=output['stdout_truncated'],
+                stderr_truncated=output['stderr_truncated'],
+                stdout_bytes=output['stdout_bytes'],
+                stderr_bytes=output['stderr_bytes'],
+                output_limit_bytes=output['output_limit_bytes'],
+                error_type='timeout_error' if output.get('timed_out') else '',
+                error_message=output['stderr'] if output.get('timed_out') else '',
             )
         except subprocess.TimeoutExpired:
             return SSHResult(
                 success=False,
                 stdout="",
                 stderr=f"Command timeout after {self.timeout} seconds",
-                exit_code=-1
+                exit_code=-1,
+                error_type='timeout_error',
+                error_message=f"Command timeout after {self.timeout} seconds",
             )
         except Exception as e:
             return SSHResult(
@@ -377,7 +387,8 @@ class NativeSSHClient:
             # 如果有错误输出，也返回
             if process.stderr:
                 for line in process.stderr:
-                    yield f"[STDERR] {line.rstrip('\n')}"
+                    line = line.rstrip('\n')
+                    yield f"[STDERR] {line}"
 
         except subprocess.TimeoutExpired:
             if process:

@@ -10,6 +10,8 @@ import os
 import json
 from typing import Optional, Dict, Tuple
 
+from output_utils import run_bounded_process
+
 
 def _get_windows_native_ssh_path(exe_name: str = 'ssh.exe') -> Optional[str]:
     """
@@ -208,13 +210,13 @@ def execute_native_ssh(
         # 转换路径为 Windows 格式
         ssh_config_path_win = ssh_config_path.replace('/', '\\')
 
-        # 构建 PowerShell SSH 命令
-        # 使用 & "path" 语法指定原生 SSH，-NoProfile 加快启动
         ssh_cmd = [
-            'powershell',
-            '-NoProfile',
-            '-Command',
-            f'& "{native_ssh_exe}" -F "{ssh_config_path_win}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new {alias} "{command}"'
+            native_ssh_exe,
+            '-F', ssh_config_path_win,
+            '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=accept-new',
+            alias,
+            command,
         ]
     else:
         # Unix/Linux：直接执行 SSH
@@ -228,21 +230,23 @@ def execute_native_ssh(
         ]
 
     try:
-        result = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            encoding='utf-8',
-            errors='replace'
-        )
+        output = run_bounded_process(ssh_cmd, timeout=timeout)
+        method = 'native_ssh_windows' if os.name == 'nt' else 'native_ssh'
 
         return {
-            'success': result.returncode == 0,
-            'exit_code': result.returncode,
-            'stdout': result.stdout,
-            'stderr': result.stderr,
-            'method': 'native_ssh_windows' if os.name == 'nt' else 'native_ssh'
+            'success': output['exit_code'] == 0,
+            'exit_code': output['exit_code'],
+            'stdout': output['stdout'],
+            'stderr': output['stderr'],
+            'stdout_truncated': output['stdout_truncated'],
+            'stderr_truncated': output['stderr_truncated'],
+            'stdout_bytes': output['stdout_bytes'],
+            'stderr_bytes': output['stderr_bytes'],
+            'output_limit_bytes': output['output_limit_bytes'],
+            'error_type': 'timeout_error' if output.get('timed_out') else '',
+            'error_message': output['stderr'] if output.get('timed_out') else '',
+            'method': method,
+            'connector': method,
         }
 
     except subprocess.TimeoutExpired:
@@ -251,6 +255,8 @@ def execute_native_ssh(
             'exit_code': -1,
             'stdout': '',
             'stderr': f'命令执行超时（{timeout}秒）',
+            'error_type': 'timeout_error',
+            'error_message': f'命令执行超时（{timeout}秒）',
             'method': 'native_ssh_windows' if os.name == 'nt' else 'native_ssh'
         }
 

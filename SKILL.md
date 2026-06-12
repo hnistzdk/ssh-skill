@@ -128,26 +128,43 @@ python ~/.claude/skills/ssh-skill/scripts/ssh_config_manager_v3.py list-servers
 
 **路径自动识别**：Python 的 `os.path.expanduser()` 会自动处理 `~`，无需手动替换。
 
+**Windows/MSYS 特例**：当命令前缀包含 `MSYS_NO_PATHCONV=1`（上传、下载、服务器间传输）时，脚本路径不要使用 `~/.claude/...`，必须使用正斜杠 Windows 绝对路径，例如 `C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/ssh_upload.py`。否则 MSYS/Python 可能把脚本路径错误解析成 `D:/c/Users/...`。
+
 ### 调用格式（唯一正确方式）
 
-**MUST**: 使用 `python ~/.claude/skills/ssh-skill/scripts/脚本名.py` 格式。使用别名（alias）标识服务器。
+**MUST**: 使用 `python ~/.claude/skills/ssh-skill/scripts/脚本名.py` 格式。使用别名（alias）标识服务器；但上传/下载/服务器间传输在 Windows/MSYS 下必须使用 `python "C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/脚本名.py"`。
 
 **NEVER**: 不要使用 `cd` 到脚本目录再执行，不要使用反斜杠 `\`，不要直接写 `ssh` 或 `scp` 命令。
 
 ### 执行远程命令
 
+短命令继续使用 inline 模式：
+
 ```bash
 python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py <别名> "<命令>"
 ```
 
-可选参数：`--timeout <秒>` `--no-daemon`
+复杂引号、正则、变量、heredoc 或多行脚本使用脚本模式，避免本地 shell 提前展开：
 
-ssh_execute.py 会自动检测守护进程：有则走长连接（~0.12s），无则自动启动守护进程。
+```bash
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py <别名> --stdin-script < script.sh
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py <别名> --script-file script.sh
+```
+
+可选参数：`--timeout <秒>` `--password <密码>` `--no-daemon` `--cwd <远程目录>` `--shell <sh|bash|cmd|powershell>`
+
+认证失败或需要更新密码时使用 `--password`，命令执行成功后会保存到该别名的 SSH config 元数据；命令失败不会保存，避免持久化错误密码：
+
+```bash
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py <别名> "true" --password '<密码>'
+```
+
+ssh_execute.py 会自动检测守护进程：有则走长连接（~0.12s），无则自动启动守护进程。daemon、直连 Paramiko、native SSH 使用统一执行规格；大输出会返回 `stdout_truncated`、`stderr_truncated`、`stdout_bytes`、`stderr_bytes`、`output_limit_bytes` 元数据。
 
 ### 上传文件
 
 ```bash
-MSYS_NO_PATHCONV=1 python ~/.claude/skills/ssh-skill/scripts/ssh_upload.py <别名> "<本地路径>" "<远程路径>"
+MSYS_NO_PATHCONV=1 python "C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/ssh_upload.py" <别名> "<本地路径>" "<远程路径>"
 ```
 
 可选参数：`--resume`（断点续传） `--recursive`（目录递归上传） `--no-progress`（禁用进度输出）
@@ -155,7 +172,7 @@ MSYS_NO_PATHCONV=1 python ~/.claude/skills/ssh-skill/scripts/ssh_upload.py <别�
 ### 下载文件
 
 ```bash
-MSYS_NO_PATHCONV=1 python ~/.claude/skills/ssh-skill/scripts/ssh_download.py <别名> "<远程路径>" "<本地路径>"
+MSYS_NO_PATHCONV=1 python "C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/ssh_download.py" <别名> "<远程路径>" "<本地路径>"
 ```
 
 可选参数：`--resume`（断点续传） `--recursive`（目录递归下载） `--no-progress`（禁用进度输出）
@@ -166,19 +183,19 @@ MSYS_NO_PATHCONV=1 python ~/.claude/skills/ssh-skill/scripts/ssh_download.py <�
 
 ```bash
 # 自动模式（推荐）- 根据文件大小和网络环境自动选择最优方式
-MSYS_NO_PATHCONV=1 python "~/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>"
+MSYS_NO_PATHCONV=1 python "C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>"
 
 # 强制直连模式（大文件推荐，数据直接在服务器间传输）
-MSYS_NO_PATHCONV=1 python "~/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>" --mode direct
+MSYS_NO_PATHCONV=1 python "C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>" --mode direct
 
 # 强制流式转发（小文件或服务器间网络不通时）
-MSYS_NO_PATHCONV=1 python "~/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>" --mode stream
+MSYS_NO_PATHCONV=1 python "C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>" --mode stream
 
 # 混合模式（先尝试直连，失败后自动降级到流式）
-MSYS_NO_PATHCONV=1 python "~/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>" --mode hybrid
+MSYS_NO_PATHCONV=1 python "C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>" --mode hybrid
 
 # 使用 rsync（仅直连模式，支持增量同步）
-MSYS_NO_PATHCONV=1 python "~/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>" --use-rsync
+MSYS_NO_PATHCONV=1 python "C:/Users/<用户名>/.claude/skills/ssh-skill/scripts/ssh_server_transfer.py" <源别名> "<源路径>" <目标别名> "<目标路径>" --use-rsync
 ```
 
 可选参数：`--mode <auto|direct|stream|hybrid>`（传输模式） `--use-rsync`（使用 rsync） `--no-progress`（禁用进度） `--size-threshold <MB>`（大小阈值，默认 10） `--timeout <秒>`（超时，默认 300）

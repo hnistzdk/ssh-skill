@@ -158,9 +158,26 @@ pip install paramiko
 
 ### Execute Remote Commands
 
+Use inline mode for short commands:
+
 ```bash
 python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py prod-web-01 "systemctl status nginx"
 ```
+
+Use script mode for complex quoting, regexes, variables, heredocs, or multiline scripts so the local shell does not expand them first:
+
+```bash
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py prod-web-01 --stdin-script < script.sh
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py prod-web-01 --script-file script.sh
+```
+
+Use `--password` when authentication fails or a password needs to be updated. The password is persisted to the alias metadata in SSH config only after the command succeeds; failed commands do not persist credentials:
+
+```bash
+python ~/.claude/skills/ssh-skill/scripts/ssh_execute.py prod-web-01 "true" --password '<password>'
+```
+
+Command results consistently include `stdout_truncated`, `stderr_truncated`, `stdout_bytes`, `stderr_bytes`, and `output_limit_bytes`; truncation on large output is expected behavior.
 
 ### Upload Files
 

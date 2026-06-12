@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.join(_script_dir, 'lib'))
 
 from path_normalization import normalize_remote_path, PathNormalizationError
 from reporting import add_reporting_arguments, emit_json
+from exec_spec import build_inline_exec_spec, build_script_exec_spec, render_exec_spec
 
 
 def _build_error(code, message, details=None, cause=None, retriable=False):
@@ -143,31 +144,69 @@ def _recv_message(sock, timeout=None):
     return json.loads(body.decode('utf-8'))
 
 
-def try_daemon_execute(alias, command, timeout):
-    """尝试通过守护进程执行命令，返回 None 表示守护进程不可用"""
+def try_daemon_execute(alias, exec_spec, timeout):
+    """尝试通过守护进程执行命令，返回 None 表示守护进程不可用。"""
     from ssh_daemon import read_daemon_info
 
     info = read_daemon_info(alias)
     if not info:
         return None
 
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout + 5)
         sock.connect(('127.0.0.1', info['port']))
         _send_message(sock, {
             'action': 'execute',
-            'command': command,
+            'exec': exec_spec,
             'timeout': timeout
         })
         result = _recv_message(sock, timeout=timeout + 5)
-        sock.close()
-        if isinstance(result, dict):
-            result.setdefault('mode', 'daemon')
-            result.setdefault('method', 'daemon')
+        if not isinstance(result, dict):
+            return {
+                'success': False,
+                'exit_code': -1,
+                'stdout': '',
+                'stderr': 'Daemon returned malformed response',
+                'error_type': 'protocol_error',
+                'error_message': 'Daemon returned malformed response',
+                'mode': 'daemon',
+                'method': 'daemon',
+                'connector': 'daemon',
+            }
+        result.setdefault('mode', 'daemon')
+        result.setdefault('method', 'daemon')
+        result.setdefault('connector', 'daemon')
         return result
-    except Exception:
+    except (ConnectionRefusedError, socket.timeout, TimeoutError):
         return None
+    except Exception as e:
+        return {
+            'success': False,
+            'exit_code': -1,
+            'stdout': '',
+            'stderr': str(e),
+            'error_type': 'protocol_error',
+            'error_message': str(e),
+            'mode': 'daemon',
+            'method': 'daemon',
+            'connector': 'daemon',
+        }
+    finally:
+        try:
+            if sock:
+                sock.close()
+        except Exception:
+            pass
+
+
+def persist_alias_password(alias, password):
+    if not password:
+        return False
+    from ssh_config_manager_v3 import SSHConfigManager
+    manager = SSHConfigManager()
+    return manager.update_host(alias, password=password)
 
 
 def start_daemon_background(alias):
@@ -201,8 +240,8 @@ def start_daemon_background(alias):
         return False
 
 
-def direct_execute(alias, command, timeout, cwd=None, shell=None, quiet=False):
-    """直连执行命令（智能选择客户端类型，支持降级到原生 SSH）"""
+def direct_execute(alias, exec_spec, timeout, quiet=False):
+    """直连执行命令（智能选择客户端类型，支持降级到原生 SSH）。"""
     from config_v3 import SSHConfigLoaderV3
     from native_ssh_fallback import should_use_native_ssh, execute_native_ssh, check_ssh_agent
 
@@ -217,10 +256,12 @@ def direct_execute(alias, command, timeout, cwd=None, shell=None, quiet=False):
         pass
 
     params = loader.get_connection_params(alias)
-    runtime_command = _build_runtime_command(command, cwd=cwd, shell=shell)
+    runtime_command = render_exec_spec(exec_spec)
 
     # 检测是否应该降级到原生 SSH
     should_fallback, reason = should_use_native_ssh(ssh_config, metadata)
+    if params.get('password') and params.get('proxy_command'):
+        should_fallback = False
 
     if should_fallback:
         # 检查 ssh-agent 状态（如果涉及密钥认证）
@@ -253,40 +294,71 @@ def direct_execute(alias, command, timeout, cwd=None, shell=None, quiet=False):
         'exit_code': result.exit_code,
         'stdout': result.stdout,
         'stderr': result.stderr,
+        'stdout_truncated': getattr(result, 'stdout_truncated', False),
+        'stderr_truncated': getattr(result, 'stderr_truncated', False),
+        'stdout_bytes': getattr(result, 'stdout_bytes', len((result.stdout or '').encode('utf-8', errors='replace'))),
+        'stderr_bytes': getattr(result, 'stderr_bytes', len((result.stderr or '').encode('utf-8', errors='replace'))),
+        'output_limit_bytes': getattr(result, 'output_limit_bytes', 0),
+        'error_type': getattr(result, 'error_type', ''),
+        'error_message': getattr(result, 'error_message', ''),
         'method': mode,
         'mode': mode,
+        'connector': mode,
     }
 
 
-def execute_command(alias, command, timeout, no_daemon=False, cwd=None, shell=None, quiet=False):
+def execute_exec_spec(alias, exec_spec, timeout, no_daemon=False, quiet=False, password=None):
     """统一执行入口，供主命令和 verification 复用。"""
     from config_v3 import SSHConfigLoaderV3
 
-    loader = SSHConfigLoaderV3()
-    params = loader.get_connection_params(alias)
+    env_name = f'SSH_SKILL_PASSWORD_{SSHConfigLoaderV3._normalize_alias_for_env(alias)}'
+    previous_password = os.environ.get(env_name) if password else None
+    if password:
+        os.environ[env_name] = password
 
-    has_password = params.get('password') is not None
-    runtime_command = _build_runtime_command(command, cwd=cwd, shell=shell)
-    result = None
+    try:
+        loader = SSHConfigLoaderV3()
+        params = loader.get_connection_params(alias)
 
-    if has_password and not no_daemon:
-        result = try_daemon_execute(alias, runtime_command, timeout)
-        if result is None and start_daemon_background(alias):
-            result = try_daemon_execute(alias, runtime_command, timeout)
+        has_password = params.get('password') is not None
+        runtime_command = render_exec_spec(exec_spec)
+        result = None
 
-    if result is None:
-        result = direct_execute(alias, command, timeout, cwd=cwd, shell=shell, quiet=quiet)
+        if has_password and not no_daemon:
+            result = try_daemon_execute(alias, exec_spec, timeout)
+            if result is None and start_daemon_background(alias):
+                result = try_daemon_execute(alias, exec_spec, timeout)
 
-    if isinstance(result, dict):
-        mode = result.get('mode')
-        if mode is None:
-            mode = 'paramiko' if has_password else 'native'
-            result['mode'] = mode
-        if result.get('method') is None:
-            result['method'] = 'daemon' if mode == 'daemon' else mode
-        result.setdefault('runtime_command', runtime_command)
+        if result is None:
+            result = direct_execute(alias, exec_spec, timeout, quiet=quiet)
 
-    return result
+        if isinstance(result, dict):
+            mode = result.get('mode')
+            if mode is None:
+                mode = 'paramiko' if has_password else 'native'
+                result['mode'] = mode
+            if result.get('method') is None:
+                result['method'] = 'daemon' if mode == 'daemon' else mode
+            if result.get('connector') is None:
+                result['connector'] = result.get('method') or mode
+            result.setdefault('runtime_command', runtime_command)
+
+        if password and isinstance(result, dict) and result.get('success'):
+            if persist_alias_password(alias, password):
+                result['credential_persisted'] = True
+
+        return result
+    finally:
+        if password:
+            if previous_password is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = previous_password
+
+
+def execute_command(alias, command, timeout, no_daemon=False, cwd=None, shell=None, quiet=False, password=None):
+    exec_spec = build_inline_exec_spec(command, cwd=cwd, shell=shell)
+    return execute_exec_spec(alias, exec_spec, timeout, no_daemon=no_daemon, quiet=quiet, password=password)
 
 
 def _build_execute_result(raw_result, command, timeout, duration_ms, cwd=None, shell=None, verbose=False):
@@ -297,6 +369,11 @@ def _build_execute_result(raw_result, command, timeout, duration_ms, cwd=None, s
         'exit_code': raw_result.get('exit_code'),
         'stdout': raw_result.get('stdout', ''),
         'stderr': raw_result.get('stderr', ''),
+        'stdout_truncated': bool(raw_result.get('stdout_truncated', False)),
+        'stderr_truncated': bool(raw_result.get('stderr_truncated', False)),
+        'stdout_bytes': raw_result.get('stdout_bytes'),
+        'stderr_bytes': raw_result.get('stderr_bytes'),
+        'output_limit_bytes': raw_result.get('output_limit_bytes'),
     }
 
     if cwd is not None:
@@ -309,6 +386,8 @@ def _build_execute_result(raw_result, command, timeout, duration_ms, cwd=None, s
         result['method'] = raw_result.get('method')
     if raw_result.get('fallback_reason'):
         result['fallback_reason'] = raw_result.get('fallback_reason')
+    if raw_result.get('credential_persisted') is not None:
+        result['credential_persisted'] = bool(raw_result.get('credential_persisted'))
     if verbose:
         result['reporting'] = {
             'mode': raw_result.get('mode'),
@@ -342,6 +421,16 @@ def _normalize_execute_error(alias, command, timeout, mode, raw_result, cwd=None
         details['method'] = method
 
     lower_stderr = stderr.lower()
+    if 'permission denied' in lower_stderr or 'passphrase' in lower_stderr or 'auth' in lower_stderr:
+        details['credential_hint'] = 'Provide --password to retry and persist the password for this alias.'
+        return _build_error(
+            'auth_error',
+            stderr or 'Authentication failed',
+            details=details,
+            cause=stderr or None,
+            retriable=False,
+        )
+
     if exit_code not in (None, -1):
         return _build_error(
             'remote_command_error',
@@ -540,8 +629,11 @@ def _run_verification_checks(alias, timeout, no_daemon, verification_options, cw
 def main():
     parser = argparse.ArgumentParser(description='SSH command execution tool v3.0')
     parser.add_argument('alias', help='SSH host alias from ~/.ssh/config')
-    parser.add_argument('command', help='Command to execute')
+    parser.add_argument('command', nargs='?', help='Command to execute')
+    parser.add_argument('--stdin-script', action='store_true', help='Read script from stdin and execute remotely')
+    parser.add_argument('--script-file', help='Read script from local file and execute remotely')
     parser.add_argument('--timeout', type=int, help='Timeout in seconds')
+    parser.add_argument('--password', help='Password to use for this alias and persist after a successful connection')
     parser.add_argument('--no-daemon', action='store_true',
                         help='Disable daemon mode, use direct SSH connection')
     parser.add_argument('--cwd', help='Remote working directory')
@@ -559,16 +651,62 @@ def main():
 
     args = parser.parse_args()
     timeout = args.timeout or 30
+    command_text = args.command or args.script_file or '<stdin-script>'
+
+    command_sources = [bool(args.command), bool(args.stdin_script), bool(args.script_file)]
+    if sum(command_sources) != 1:
+        emit_json(_build_failure(
+            alias=args.alias,
+            code='cli_argument_error',
+            message='Exactly one of <command>, --stdin-script, or --script-file is required',
+            details={
+                'target': args.alias,
+                'command': args.command,
+                'stdin_script': args.stdin_script,
+                'script_file': args.script_file,
+                'timeout': timeout,
+            },
+            cause='invalid command source',
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
+        sys.exit(1)
 
     try:
         cwd = _normalize_runtime_path(args.cwd, role='cwd', shell=args.shell)
         verification_options = _normalize_verification_options(args, shell=args.shell)
+        if args.stdin_script:
+            command_text = '<stdin-script>'
+            exec_spec = build_script_exec_spec(sys.stdin.read(), cwd=cwd, shell=args.shell)
+        elif args.script_file:
+            command_text = args.script_file
+            with open(args.script_file, 'r', encoding='utf-8') as f:
+                exec_spec = build_script_exec_spec(f.read(), cwd=cwd, shell=args.shell)
+        else:
+            command_text = args.command
+            exec_spec = build_inline_exec_spec(args.command, cwd=cwd, shell=args.shell)
     except PathNormalizationError as e:
         emit_json(_build_failure(
             alias=args.alias,
             code=e.code,
             message=str(e),
             details=e.to_error().get('details'),
+            cause=str(e),
+            retriable=False,
+        ), args=args, stream=sys.stderr, ensure_ascii=True)
+        sys.exit(1)
+    except FileNotFoundError as e:
+        emit_json(_build_failure(
+            alias=args.alias,
+            code='cli_argument_error',
+            message=f'Script file not found: {e}',
+            details={
+                'target': args.alias,
+                'command': command_text,
+                'script_file': args.script_file,
+                'timeout': timeout,
+                'cwd': args.cwd,
+                'shell': args.shell,
+            },
             cause=str(e),
             retriable=False,
         ), args=args, stream=sys.stderr, ensure_ascii=True)
@@ -580,7 +718,7 @@ def main():
             message=str(e),
             details={
                 'target': args.alias,
-                'command': args.command,
+                'command': command_text,
                 'timeout': timeout,
                 'cwd': args.cwd,
                 'shell': args.shell,
@@ -592,14 +730,13 @@ def main():
 
     try:
         start_time = time.time()
-        result = execute_command(
+        result = execute_exec_spec(
             args.alias,
-            args.command,
+            exec_spec,
             timeout,
             no_daemon=args.no_daemon,
-            cwd=cwd,
-            shell=args.shell,
             quiet=args.quiet,
+            password=args.password,
         )
         duration_ms = int((time.time() - start_time) * 1000)
         mode = result.get('mode')
@@ -620,9 +757,9 @@ def main():
         success = primary_success and verification['success']
         error = None
         if not primary_success:
-            error = _normalize_execute_error(args.alias, args.command, timeout, mode, result, cwd=cwd, shell=args.shell)
+            error = _normalize_execute_error(args.alias, command_text, timeout, mode, result, cwd=cwd, shell=args.shell)
         elif not verification['success']:
-            error = _build_verification_failure(args.alias, args.command, timeout, mode, verification, cwd=cwd, shell=args.shell)
+            error = _build_verification_failure(args.alias, command_text, timeout, mode, verification, cwd=cwd, shell=args.shell)
 
         emit_json({
             'schema_version': '1.0',
@@ -630,20 +767,21 @@ def main():
             'operation': 'execute',
             'target': args.alias,
             'mode': mode,
-            'result': _build_execute_result(result, args.command, timeout, duration_ms, cwd=cwd, shell=args.shell, verbose=args.verbose),
+            'result': _build_execute_result(result, command_text, timeout, duration_ms, cwd=cwd, shell=args.shell, verbose=args.verbose),
             'verification': verification,
             'error': error,
         }, args=args, ensure_ascii=True)
         sys.exit(0 if success else 1)
 
     except FileNotFoundError as e:
+        is_script_file_error = bool(args.script_file)
         emit_json(_build_failure(
             alias=args.alias,
-            code='target_resolution_error',
-            message=f'Config not found: {e}',
+            code='cli_argument_error' if is_script_file_error else 'target_resolution_error',
+            message=f'Script file not found: {e}' if is_script_file_error else f'Config not found: {e}',
             details={
                 'target': args.alias,
-                'command': args.command,
+                'command': command_text,
                 'timeout': timeout,
                 'cwd': cwd,
                 'shell': args.shell,
@@ -659,7 +797,7 @@ def main():
             message=f'Invalid alias: {e}',
             details={
                 'target': args.alias,
-                'command': args.command,
+                'command': command_text,
                 'timeout': timeout,
                 'cwd': cwd,
                 'shell': args.shell,
@@ -675,7 +813,7 @@ def main():
             message=f'Execution error: {e}',
             details={
                 'target': args.alias,
-                'command': args.command,
+                'command': command_text,
                 'timeout': timeout,
                 'cwd': cwd,
                 'shell': args.shell,

@@ -292,6 +292,10 @@ class SSHConfigLoaderV3:
             params['proxy_jump'] = proxy_jump
             params['jump_hosts'] = self._build_jump_hosts(proxy_jump)
 
+        proxy_command = config.get('proxycommand')
+        if proxy_command:
+            params['proxy_command'] = proxy_command
+
         forward_agent = config.get('forwardagent', 'no').lower()
         params['forward_agent'] = forward_agent in ('yes', 'true', '1')
 
@@ -349,7 +353,8 @@ class SSHConfigLoaderV3:
                 key_file=params.get('key_file'),
                 timeout=params['timeout'],
                 jump_hosts=params.get('jump_hosts'),
-                forward_agent=params.get('forward_agent', False)
+                forward_agent=params.get('forward_agent', False),
+                proxy_command=params.get('proxy_command')
             )
 
         client.alias = alias
